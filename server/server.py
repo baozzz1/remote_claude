@@ -10,6 +10,7 @@ Proxy Server
 
 import asyncio
 import atexit
+import hashlib
 import logging
 import os
 import pty
@@ -92,6 +93,88 @@ class _VirtualCursor:
 
     def __init__(self, y: int):
         self.y = y
+
+
+def _dedup_block_id(b) -> str:
+    """计算 block 的稳定 ID（首行内容作为 key），与 shared_state._block_id_from_dict 对齐。
+
+    若首行为空（理论不会从 parser 出现），返回 "" 表示不参与 block_id 去重，避免
+    所有空 OutputBlock 被折叠成一个。
+    """
+    from utils.components import OutputBlock, UserInput, PlanBlock, SystemBlock
+
+    if isinstance(b, UserInput):
+        first = (b.text or "").split('\n', 1)[0][:80]
+        return f"U:{first}" if first else ""
+    if isinstance(b, OutputBlock):
+        first = (b.content or "").split('\n', 1)[0].strip()[:80]
+        return f"O:{first}" if first else ""
+    if isinstance(b, PlanBlock):
+        title = (b.title or "")[:80]
+        return f"PL:{title}" if title else ""
+    if isinstance(b, SystemBlock):
+        first = (b.content or "").split('\n', 1)[0].strip()[:80]
+        return f"S:{first}" if first else ""
+    return ""
+
+
+def _dedup_content_hash(b) -> str:
+    """计算 OutputBlock 的正文 hash（捕获首行因动画微调但正文一致的 Ink 重绘副本）。
+
+    仅对 OutputBlock 生效，且只在存在 ≥2 行正文时 hash 首行之后的内容 —— 这样 Ink 在首行
+    追加 spinner / 进度数字等微调时，body 不变仍会被识别为同一 block；单行 block 跳过 pass 2，
+    避免跟 pass 1 重复判定。
+    """
+    from utils.components import OutputBlock
+    if not isinstance(b, OutputBlock):
+        return ""
+    content = (b.content or "").strip()
+    if '\n' not in content:
+        return ""  # 单行 block 完全由 pass 1 负责，pass 2 不再兜底
+    body = content.split('\n', 1)[1].strip()
+    if not body:
+        return ""
+    return hashlib.sha1(body.encode('utf-8', errors='replace')).hexdigest()
+
+
+def _dedup_blocks(blocks: list) -> list:
+    """去除 Ink 整屏重绘造成的 block 重复副本。
+
+    Claude CLI 等 Ink 框架会做整屏重绘；当输出超过 PTY_ROWS 时，旧渲染会被滚进
+    HistoryScreen.history.top，新渲染落回 screen.buffer，导致 VirtualScreen 同时暴露
+    同一个 block 的多份拷贝。此函数做两轮去重，每个 key 只保留最后一次出现：
+
+    - Pass 1 按 block_id（首行内容）去重
+    - Pass 2 按 OutputBlock 正文 hash 兜底
+    """
+    if len(blocks) < 2:
+        return blocks
+
+    # Pass 1：按 block_id 只保留最后一次出现（倒序扫描 + 反转）
+    seen_ids: set = set()
+    pass1 = []
+    for b in reversed(blocks):
+        bid = _dedup_block_id(b)
+        if bid and bid in seen_ids:
+            continue
+        if bid:
+            seen_ids.add(bid)
+        pass1.append(b)
+    pass1.reverse()
+
+    # Pass 2：按 OutputBlock 正文 hash 只保留最后一次
+    seen_hashes: set = set()
+    pass2 = []
+    for b in reversed(pass1):
+        h = _dedup_content_hash(b)
+        if h and h in seen_hashes:
+            continue
+        if h:
+            seen_hashes.add(h)
+        pass2.append(b)
+    pass2.reverse()
+
+    return pass2
 
 
 class VirtualScreen:
@@ -406,8 +489,14 @@ class OutputWatcher:
                         b.is_streaming = True
                         break
 
-            # 5. 直接使用 visible_blocks（VirtualScreen 已包含 history.top + 当前屏幕）
-            all_blocks = visible_blocks
+            # 5. VirtualScreen 已包含 history.top + 当前屏幕；Ink 框架整屏重绘会把同一个 block
+            #    同时留在 history 和 buffer，需要按 block_id + OutputBlock 正文 hash 两轮去重。
+            all_blocks = _dedup_blocks(visible_blocks)
+            if len(all_blocks) != len(visible_blocks):
+                self._flush_logger.debug(
+                    f"[dedup] {len(visible_blocks)} → {len(all_blocks)} blocks "
+                    f"(drop {len(visible_blocks) - len(all_blocks)} Ink 重绘副本)"
+                )
 
             # 5b. 后台 agent 摘要：BottomBar 有 agent 信息但面板未展开时，
             #     生成 summary 类型的 AgentPanelBlock（确保下游始终能感知后台 agent）

@@ -68,7 +68,12 @@ PTY data → self._renderer.feed(data) → HistoryScreen(220×100, history=5000)
                                  │ 平滑 block blink     │
                                  └────────┬──────────┘
                                           ↓
-                                    all_blocks = visible_blocks
+                                 ┌── Ink 重绘副本去重 ──┐
+                                 │ pass 1 按 block_id     │
+                                 │ pass 2 按正文 hash     │
+                                 └────────┬─────────────┘
+                                          ↓
+                                    all_blocks = 去重后的 visible_blocks
                                           ↓
                                     ClaudeWindow 快照
                                           ↓
@@ -221,7 +226,13 @@ ClaudeWindow {
 - `Q:{question[:80]}` — OptionBlock(sub_type="option")
 - `P:{question[:80]}` — OptionBlock(sub_type="permission")
 
-**累积列表（VirtualScreen 模式）**：`visible_blocks` 直接来自 VirtualScreen 解析（含 history.top 中已滚出的历史行），`all_blocks = visible_blocks`，不再需要 `_accumulated_blocks` 和 `_merge_blocks`。历史由 `HistoryScreen.history.top`（5000 行容量）保存，parser 通过 VirtualBuffer 透明访问。
+**累积列表（VirtualScreen 模式）**：`visible_blocks` 直接来自 VirtualScreen 解析（含 history.top 中已滚出的历史行），随后交给 `_dedup_blocks()` 做两轮去重得到 `all_blocks`。历史由 `HistoryScreen.history.top`（5000 行容量）保存，parser 通过 VirtualBuffer 透明访问。
+
+**Ink 重绘副本去重**（`server/server.py` `_dedup_blocks`）：Claude/Codex/Cursor Agent 均基于 Ink 框架，输出超过 `PTY_ROWS` 时会整屏重绘，旧渲染被滚进 `history.top`、新渲染落回 `buffer`，VirtualScreen 会同时暴露同一 block 的多份拷贝（典型症状：最终总结被重复 N 遍）。`_dedup_blocks` 做两轮去重，每个 key 只保留最后一次出现：
+- **Pass 1（block_id）**：首行内容作为 key（与 `shared_state._block_id_from_dict` 对齐），覆盖绝大多数 Ink 重绘副本
+- **Pass 2（正文 hash）**：仅对 ≥2 行的 OutputBlock，hash 首行之后的正文；捕获首行因 spinner / 计数器动画微调、但正文完全一致的副本。单行 block 跳过 pass 2，避免与 pass 1 重复判定
+
+去重后输出顺序保持原样（按最后一次出现的位置排列），`start_row` 也取最后一次出现的值。
 
 **时序窗口平滑**（WINDOW_SECONDS=1.0）：
 - 每帧记录 `_FrameObs(ts, status_line, block_blink)` 到 deque，清理过期帧
@@ -623,6 +634,7 @@ remote_claude/
 │   ├── test_format_unit.py     # 格式化单元测试
 │   ├── test_component_parser.py
 │   ├── test_stream_poller.py   # 流式卡片模型单元测试（card_builder + poller）
+│   ├── test_dedup_blocks.py    # Ink 重绘副本去重单元测试
 │   ├── test_integration.py     # 集成测试
 │   ├── test_attach_dedup.py
 │   ├── test_message_queue.py
@@ -699,6 +711,7 @@ uv run python3 remote_claude.py lark status    # 查看状态和日志
 ```bash
 uv run python3 tests/test_format_unit.py                  # 格式化逻辑单元测试（见 TEST_PLAN.md 层1）
 uv run python3 tests/test_stream_poller.py                # 流式卡片模型测试（card_builder + poller）
+uv run python3 tests/test_dedup_blocks.py                 # Ink 重绘副本去重测试（server._dedup_blocks）
 uv run python3 tests/test_renderer.py                     # 终端渲染器测试
 uv run python3 tests/test_output_clean.py                 # 输出清理器测试
 uv run python3 lark_client/output_cleaner.py              # output_cleaner 自带测试
