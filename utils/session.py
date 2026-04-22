@@ -8,6 +8,7 @@
 
 import hashlib
 import os
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -34,6 +35,11 @@ def get_chat_bindings_file() -> Path:
 def get_lark_log_file() -> Path:
     """获取飞书客户端日志文件路径"""
     return USER_DATA_DIR / "lark_client.log"
+
+
+def get_startup_log_file() -> Path:
+    """获取启动日志文件路径"""
+    return USER_DATA_DIR / "startup.log"
 
 
 def ensure_user_data_dir():
@@ -89,6 +95,33 @@ def generate_client_id() -> str:
 def get_tmux_session_name(session_name: str) -> str:
     """获取 tmux 会话名称"""
     return f"{TMUX_SESSION_PREFIX}{_safe_filename(session_name)}"
+
+
+def _read_resume_target_from_startup_log(session_name: str) -> str:
+    """从 startup.log 回溯提取某个会话的 `--resume` 目标。"""
+    log_path = get_startup_log_file()
+    if not log_path.exists():
+        return ""
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+
+    for line in reversed(lines):
+        if "server_cmd:" not in line or session_name not in line or "--resume" not in line:
+            continue
+        try:
+            argv = shlex.split(line.split("server_cmd:", 1)[1].strip())
+        except ValueError:
+            continue
+        if session_name not in argv:
+            continue
+        for i, arg in enumerate(argv):
+            if arg == "--resume" and i + 1 < len(argv):
+                return argv[i + 1].strip()
+            if arg.startswith("--resume="):
+                return arg.split("=", 1)[1].strip()
+    return ""
 
 
 # ============== tmux 操作 ==============
@@ -279,11 +312,15 @@ def list_active_sessions() -> List[dict]:
                     reader._path = mq_path
                     snapshot = reader.read()
                     cli_type = snapshot.get("cli_type", "claude")
+                    resume_target = snapshot.get("resume_target", "")
+                    if not resume_target:
+                        resume_target = _read_resume_target_from_startup_log(display_name)
                 except Exception as e:
                     import logging
                     logger = logging.getLogger('Session')
                     logger.warning(f"读取共享内存 cli_type 失败: session={display_name}, error={e}")
                     cli_type = "claude"
+                    resume_target = _read_resume_target_from_startup_log(display_name)
 
                 # tmux 会话名也用 safe_name 直接构造
                 tmux_name = f"{TMUX_SESSION_PREFIX}{safe_name}"
@@ -300,7 +337,8 @@ def list_active_sessions() -> List[dict]:
                     "start_time": start_time,
                     "mtime": mtime,
                     "tmux": tmux_exists,
-                    "cli_type": cli_type
+                    "cli_type": cli_type,
+                    "resume_target": resume_target,
                 })
             except (ProcessLookupError, ValueError, OSError):
                 # 进程不存在或文件被并发清理，清理残留文件

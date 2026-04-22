@@ -141,6 +141,7 @@ class SharedStateWriter:
                 "timestamp": window.timestamp,
                 "layout_mode": window.layout_mode,
                 "cli_type": getattr(window, "cli_type", "unknown"),
+                "resume_target": getattr(window, "resume_target", ""),
             }
             data = json.dumps(snapshot, ensure_ascii=False).encode('utf-8')
 
@@ -178,7 +179,14 @@ class SharedStateReader:
     反映跨进程写入更新的问题。每次 read() 打开文件读取后关闭，保证读到最新数据。
     """
 
-    _EMPTY = {"blocks": [], "status_line": None, "bottom_bar": None, "option_block": None, "cli_type": "claude"}
+    _EMPTY = {
+        "blocks": [],
+        "status_line": None,
+        "bottom_bar": None,
+        "option_block": None,
+        "cli_type": "claude",
+        "resume_target": "",
+    }
 
     def __init__(self, session_name: str):
         self._path = get_mq_path(session_name)

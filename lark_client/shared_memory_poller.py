@@ -520,8 +520,10 @@ class SharedMemoryPoller:
         prev_ready = tracker.prev_is_ready
         tracker.prev_is_ready = current_ready
 
-        # ready → not_ready：新任务开始，重置 once 模式的通知标记
-        if prev_ready and not current_ready:
+        # ready → not_ready 表示新任务开始。仅 once 模式需要重置 last_notify_ts
+        # 以便下一次完成再次通知；5m/15m/30m 是跨任务的节流，如果这里重置，冷却
+        # 就永远触发不了，短任务连跑时会每次都立刻 @ 人。
+        if prev_ready and not current_ready and _notify_mode == "once":
             tracker.last_notify_ts = 0.0
 
         if not (current_ready and not prev_ready and tracker.is_group):

@@ -331,8 +331,8 @@ def cmd_lark_start(args):
             print(f"✓ 飞书客户端已启动")
             print(f"  PID: {pid}")
             print(f"  日志: {log_file}")
-            print(f"\n使用 'python3 remote_claude.py lark status' 查看状态")
-            print(f"使用 'python3 remote_claude.py lark stop' 停止")
+            print(f"\n使用 'remote-claude lark status' 查看状态")
+            print(f"使用 'remote-claude lark stop' 停止")
             _start_watchdog()
             return 0
         else:
@@ -414,7 +414,7 @@ def cmd_lark_status(args):
     """显示飞书客户端状态"""
     if not is_lark_running():
         print("飞书客户端未运行")
-        print("\n使用 'python3 remote_claude.py lark start' 启动")
+        print("\n使用 'remote-claude lark start' 启动")
         return 0
 
     status = get_lark_status()
@@ -724,16 +724,17 @@ def cmd_lark(args):
     else:
         print("飞书客户端未运行")
         print("\n可用命令:")
-        print("  python3 remote_claude.py lark init     - 配置向导（首次使用）")
-        print("  python3 remote_claude.py lark start    - 启动客户端")
-        print("  python3 remote_claude.py lark stop     - 停止客户端")
-        print("  python3 remote_claude.py lark restart  - 重启客户端")
-        print("  python3 remote_claude.py lark status   - 查看状态")
+        print("  remote-claude lark init     - 配置向导（首次使用）")
+        print("  remote-claude lark start    - 启动客户端")
+        print("  remote-claude lark stop     - 停止客户端")
+        print("  remote-claude lark restart  - 重启客户端")
+        print("  remote-claude lark status   - 查看状态")
         return 0
 
 
 def main():
     parser = argparse.ArgumentParser(
+        prog="remote-claude",
         description="Remote Claude - 双端共享 Claude CLI 工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

@@ -78,6 +78,22 @@ from . import config
 from .lark_handler import handler
 
 
+def _normalize_action_value(raw_value):
+    """统一解析飞书卡片 action.value。"""
+    if isinstance(raw_value, dict):
+        return raw_value
+    if isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return {"action": text}
+        return parsed if isinstance(parsed, dict) else {"action": str(parsed)}
+    return {}
+
+
 async def _graceful_shutdown() -> None:
     """优雅关闭：更新所有活跃流式卡片为已断开状态后退出"""
     try:
@@ -152,7 +168,7 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
         user_id = operator.open_id
         chat_id = context.open_chat_id
         message_id = context.open_message_id  # 原始卡片 message_id，用于就地更新
-        action_value = action.value or {}
+        action_value = _normalize_action_value(action.value)
 
         print(f"[Lark] 收到卡片动作: user={user_id[:8]}..., action={action_value}")
 
@@ -215,6 +231,13 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
             session_name = action_value.get("session", "")
             print(f"[Lark] list_disband_group: session={session_name}")
             asyncio.create_task(handler._cmd_disband_group(user_id, chat_id, session_name, message_id=message_id))
+            return None
+
+        # overflow 菜单：关闭会话前的确认（弹二次确认卡片）
+        if action_type == "list_kill_confirm":
+            session_name = action_value.get("session", "")
+            print(f"[Lark] list_kill_confirm: session={session_name}")
+            asyncio.create_task(handler._cmd_kill_confirm(user_id, chat_id, session_name))
             return None
 
         # 列表卡片：关闭会话

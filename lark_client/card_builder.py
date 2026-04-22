@@ -39,12 +39,22 @@ except Exception:
     _VERSION = ""
 
 
-def _build_header(title: str, template: str) -> dict:
-    """构建卡片 header，自动附加版本号副标题"""
+def _build_header(title: str, template: str, show_subtitle: bool = True) -> dict:
+    """构建卡片 header；默认追加版本号副标题，show_subtitle=False 时省略（菜单卡等视觉优先场景）"""
     h: dict = {"title": {"tag": "plain_text", "content": title}, "template": template}
-    if _VERSION:
+    if show_subtitle and _VERSION:
         h["subtitle"] = {"tag": "plain_text", "content": _VERSION}
     return h
+
+
+def _callback_value(action: str, **extra: Any) -> Dict[str, Any]:
+    """普通 button/column 点击回调值：保留为对象，便于主入口直接读取。"""
+    return {"action": action, **extra}
+
+
+def _overflow_value(action: str, **extra: Any) -> str:
+    """overflow option 的 value 在飞书 schema 中要求 string，这里统一编码成 JSON 字符串。"""
+    return _json.dumps(_callback_value(action, **extra), ensure_ascii=False, separators=(",", ":"))
 
 # ANSI SGR 前景色码 → 飞书颜色
 # 飞书支持: blue, wathet, turquoise, green, yellow, orange, red, carmine, violet, purple, indigo, grey
@@ -789,9 +799,53 @@ def _get_display_name(name: str, cwd: str = None) -> str:
     return name
 
 
-def _build_session_list_elements(sessions: List[Dict], current_session: Optional[str], session_groups: Optional[Dict[str, str]], page: int = 0) -> List[Dict]:
-    """构建会话列表元素（供 build_menu_card 复用）"""
+def _shorten_path(cwd: str, max_len: int = 42) -> str:
+    """把绝对路径压缩成 `~/…/last-two-segments` 风格，超长时居中省略"""
     import os
+    if not cwd:
+        return ""
+    home = os.path.expanduser("~")
+    p = cwd.replace(home, "~")
+    if len(p) <= max_len:
+        return p
+    parts = p.rstrip("/").rsplit("/", 2)
+    if len(parts) > 2:
+        return "…/" + "/".join(parts[-2:])
+    return "…" + p[-(max_len - 1):]
+
+
+def _short_time(start_time: str) -> str:
+    """把时间戳压缩为「今天 HH:MM」或「MM-DD HH:MM」，更紧凑"""
+    from datetime import datetime
+    if not start_time:
+        return ""
+    s = start_time.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%m-%d %H:%M:%S", "%m-%d %H:%M"):
+        try:
+            t = datetime.strptime(s, fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        return s
+    now = datetime.now()
+    if t.year == 1900:
+        t = t.replace(year=now.year)
+    if t.date() == now.date():
+        return f"今天 {t.strftime('%H:%M')}"
+    return t.strftime("%m-%d %H:%M")
+
+
+def _build_session_list_elements(sessions: List[Dict], current_session: Optional[str], session_groups: Optional[Dict[str, str]], page: int = 0) -> List[Dict]:
+    """构建会话列表元素（供 build_menu_card 复用）
+
+    设计原则（按 Claude design 克制风格）：
+    - 每个会话 2 行信息 + 下方独立操作行，信息区整行可点（tap → attach）
+    - CLI 类型与时间/路径一起用灰色次要文字，不抢视觉焦点
+    - 群聊相关操作显式展示：未创建时显示「创建群组」；已创建时显示「进入群聊」「解散群聊」
+    - 断开连接 / 关闭会话仍收纳到 `⋯` overflow 菜单
+    - 将操作按钮与信息区拆开，避免移动端按钮 loading 时整格高度异常抖动
+    """
     elements = []
     if sessions:
         PER_PAGE = 8
@@ -799,114 +853,132 @@ def _build_session_list_elements(sessions: List[Dict], current_session: Optional
         total_pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
         page = max(0, min(page, total_pages - 1))
         shown = sessions[page * PER_PAGE : (page + 1) * PER_PAGE]
-        for s in shown:
+        for idx, s in enumerate(shown):
             name = s["name"]
             cwd = s.get("cwd", "")
             start_time = s.get("start_time", "")
             cli_type = s.get("cli_type", "claude")
             is_current = (name == current_session)
-
-            # CLI 类型颜色和标签：Claude=黄色，Codex=绿色
-            cli_color = CLI_COLORS.get(cli_type, "yellow")
-            cli_label = CLI_NAMES.get(cli_type, "Claude")
-
-            status_icon = "🟢" if is_current else "⚪"
-            current_label = "（当前）" if is_current else ""
-            short_name = _get_display_name(name, cwd)
-
-            # 构建4行内容：名字、cli类型、启动时间、目录
-            lines = [f"{status_icon} **{short_name}**{current_label}"]
-            lines.append(f"<font color=\"{cli_color}\">{cli_label}</font>")
-
-            if start_time:
-                lines.append(f"启动：{start_time}")
-
-            if cwd:
-                home = os.path.expanduser("~")
-                display_cwd = cwd.replace(home, "~")
-                if len(display_cwd) > 40:
-                    parts = display_cwd.rstrip("/").rsplit("/", 2)
-                    display_cwd = "…/" + "/".join(parts[-2:]) if len(parts) > 2 else display_cwd[-40:]
-                lines.append(f"`{display_cwd}`")
-
-            header_text = "\n".join(lines)
-
-            if is_current:
-                btn_label = "断开连接"
-                btn_type = "danger"
-                btn_action = "list_detach"
-            else:
-                btn_label = "进入会话"
-                btn_type = "primary"
-                btn_action = "list_attach"
             has_group = bool(session_groups and name in session_groups)
 
-            # 右列按钮（纵向堆叠）
-            right_buttons = [
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": btn_label},
-                    "type": btn_type,
-                    "behaviors": [{"type": "callback", "value": {
-                        "action": btn_action, "session": name
-                    }}]
-                },
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "进入群聊" if has_group else "创建群聊"},
-                    "type": "default",
-                    "behaviors": [{"type": "open_url",
-                                   "default_url": f"https://applink.feishu.cn/client/chat/open?openChatId={session_groups[name]}",
-                                   "android_url": f"https://applink.feishu.cn/client/chat/open?openChatId={session_groups[name]}",
-                                   "ios_url": f"https://applink.feishu.cn/client/chat/open?openChatId={session_groups[name]}",
-                                   "pc_url": f"https://applink.feishu.cn/client/chat/open?openChatId={session_groups[name]}"}]
-                    if has_group else
-                    [{"type": "callback", "value": {"action": "list_new_group", "session": name}}]
-                },
+            cli_label = CLI_NAMES.get(cli_type, "Claude")
+            short_name = _get_display_name(name, cwd)
+
+            # 首行：状态点 + 会话名 + 当前会话标记
+            status_dot = "●" if is_current else "○"
+            name_line = f"{status_dot}  **{_escape_md(short_name)}**"
+            if is_current:
+                name_line += "  <font color='green'>· 当前</font>"
+
+            # 次行：CLI · 时间 · 路径（全灰色次要文字，三者并列）
+            meta_bits = [cli_label]
+            if start_time:
+                meta_bits.append(_short_time(start_time))
+            if cwd:
+                meta_bits.append(_shorten_path(cwd))
+            meta_line = f"<font color='grey'>{_escape_md(' · '.join(meta_bits))}</font>"
+
+            info_elements = [
+                {"tag": "markdown", "content": name_line},
+                {"tag": "markdown", "content": meta_line},
             ]
+
+            # 非当前会话：整行可点 → attach；当前会话：信息区不响应 tap（避免误操作）
+            info_container = {
+                "tag": "interactive_container",
+                "padding": "4px 0",
+                "elements": info_elements,
+            }
+            if not is_current:
+                info_container["behaviors"] = [{"type": "callback", "value": {
+                    "action": "list_attach", "session": name,
+                }}]
+
+            # 群聊相关操作：显式展示，避免藏在 overflow 中不直观
+            action_buttons = []
             if has_group:
-                right_buttons.append({
+                group_chat_id = session_groups[name]
+                group_url = f"https://applink.feishu.cn/client/chat/open?openChatId={group_chat_id}"
+                action_buttons.append({
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "进入群聊"},
+                    "type": "default",
+                    "width": "default",
+                    "behaviors": [{
+                        "type": "open_url",
+                        "default_url": group_url,
+                        "android_url": group_url,
+                        "ios_url": group_url,
+                        "pc_url": group_url,
+                    }],
+                })
+                action_buttons.append({
                     "tag": "button",
                     "text": {"tag": "plain_text", "content": "解散群聊"},
                     "type": "danger",
+                    "width": "default",
                     "behaviors": [{"type": "callback", "value": {
                         "action": "list_disband_group", "session": name
-                    }}]
+                    }}],
                 })
-            right_buttons.append({
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "🗑️ 关闭"},
-                "type": "danger",
-                "confirm": {
-                    "title": {"tag": "plain_text", "content": "确认关闭会话"},
-                    "text": {"tag": "plain_text", "content": f"确定要关闭「{name}」吗？此操作不可撤销。"}
-                },
-                "behaviors": [{"type": "callback", "value": {
-                    "action": "list_kill", "session": name
-                }}]
+            else:
+                action_buttons.append({
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "创建群组"},
+                    "type": "default",
+                    "width": "default",
+                    "behaviors": [{"type": "callback", "value": {
+                        "action": "list_new_group", "session": name
+                    }}],
+                })
+
+            # overflow 菜单：收纳与群聊无关的次要/破坏性操作（断开 / 关闭）
+            overflow_options = []
+            if is_current:
+                overflow_options.append({
+                    "text": {"tag": "plain_text", "content": "断开连接"},
+                    "value": _overflow_value("list_detach", session=name),
+                })
+            overflow_options.append({
+                "text": {"tag": "plain_text", "content": "关闭会话"},
+                "value": _overflow_value("list_kill_confirm", session=name),
             })
+            overflow_el = {
+                "tag": "overflow",
+                "options": overflow_options,
+            }
+
+            elements.append(info_container)
+
+            action_columns = [{
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{"tag": "markdown", "content": " "}],
+            }]
+            for btn in action_buttons:
+                action_columns.append({
+                    "tag": "column",
+                    "width": "auto",
+                    "vertical_align": "center",
+                    "elements": [btn],
+                })
+            action_columns.append({
+                "tag": "column",
+                "width": "auto",
+                "vertical_align": "center",
+                "elements": [overflow_el],
+            })
+
             elements.append({
                 "tag": "column_set",
-                "flex_mode": "none",
-                "columns": [
-                    {
-                        "tag": "column",
-                        "width": "weighted",
-                        "weight": 3,
-                        "elements": [{"tag": "markdown", "content": header_text}]
-                    },
-                    {
-                        "tag": "column",
-                        "width": "weighted",
-                        "weight": 2,
-                        "elements": right_buttons
-                    },
-                ]
+                "flex_mode": "flow",
+                "horizontal_spacing": "small",
+                "columns": action_columns,
             })
-            elements.append({"tag": "hr"})
 
-        if elements and elements[-1].get("tag") == "hr":
-            elements.pop()
+            if idx < len(shown) - 1:
+                elements.append({"tag": "hr"})
 
         if total > PER_PAGE:
             prev_disabled = page == 0
@@ -945,7 +1017,14 @@ def _build_session_list_elements(sessions: List[Dict], current_session: Optional
     else:
         elements.append({
             "tag": "markdown",
-            "content": "暂无可用会话\n\n请先在终端启动：`python remote_claude.py start <名称>`"
+            "content": (
+                "<font color='grey'>暂无可用会话</font>\n\n"
+                "在本机终端任意目录运行以下任一命令即可启动：\n"
+                "- `cla` / `cl` — 启动 Claude 会话\n"
+                "- `cx` / `cdx` — 启动 Codex 会话\n"
+                "- `cag` / `cagn` — 启动 Cursor Agent 会话\n"
+                "- `remote-claude start <会话名>` — 手动指定会话名"
+            ),
         })
     return elements
 
@@ -1246,122 +1325,133 @@ def build_session_closed_card(session_name: str) -> Dict[str, Any]:
     }
 
 
+def _toggle_row(label: str, value_text: str, value_color: str, action: str,
+                disabled: bool = False) -> Dict[str, Any]:
+    """构建「左标签 + 右状态按钮」的偏好开关行，所有开关同构、视觉对齐"""
+    btn: Dict[str, Any] = {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": value_text},
+        "type": "default",
+        "width": "default",
+    }
+    if disabled:
+        btn["disabled"] = True
+    else:
+        btn["behaviors"] = [{"type": "callback", "value": {"action": action}}]
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "horizontal_spacing": "small",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 2,
+                "vertical_align": "center",
+                "elements": [{
+                    "tag": "markdown",
+                    "content": f"<font color='grey'>{label}</font>",
+                }],
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [btn],
+            },
+        ],
+    }
+
+
 def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None,
                     session_groups: Optional[Dict[str, str]] = None, page: int = 0,
                     notify_mode: str = "once", urgent_enabled: bool = False,
                     bypass_enabled: bool = False) -> Dict[str, Any]:
-    """构建快捷操作菜单卡片（/menu 和 /list 共用）：内嵌会话列表 + 快捷操作"""
-    elements = []
+    """快捷操作菜单卡片（/menu 和 /list 共用）。
 
-    elements.append({"tag": "markdown", "content": "**会话管理**"})
+    卡片结构（自上而下）：
+      - header：仅标题，不追加版本号副标题，保持视觉干净
+      - 会话列表：标题「会话 · N」，每个会话 2 行信息 + 1 行按钮
+      - 工作区：3 个等宽按钮（文件列表 / 目录树 / 刷新）
+      - 偏好设置：3 行同构 toggle（完成通知 / 加急通知 / 新会话 bypass）
+    """
+    from .shared_memory_poller import notify_mode_label
+
+    elements: List[Dict[str, Any]] = []
+
+    # ── Section 1: 会话 ──
+    total = len(sessions) if sessions else 0
+    title = f"**会话**  <font color='grey'>共 {total} 个</font>" if total else "**会话**"
+    elements.append({"tag": "markdown", "content": title})
     elements.append({"tag": "hr"})
     elements.extend(_build_session_list_elements(sessions, current_session, session_groups, page=page))
 
+    # ── Section 2: 工作区 ──
     elements.append({"tag": "hr"})
-    elements.append({"tag": "markdown", "content": "**快捷操作**"})
+    elements.append({"tag": "markdown", "content": "**工作区**"})
     elements.append({
         "tag": "column_set",
-        "flex_mode": "none",
+        "flex_mode": "flow",  # 不够宽自动换行，移动端窄屏下不会把「文件列表」压扁
+        "horizontal_spacing": "small",
         "columns": [
-            {
-                "tag": "column",
-                "width": "weighted",
-                "weight": 1,
-                "elements": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "📂 文件列表"},
-                    "type": "default",
-                    "behaviors": [{"type": "callback", "value": {"action": "menu_ls"}}]
-                }]
-            },
-            {
-                "tag": "column",
-                "width": "weighted",
-                "weight": 1,
-                "elements": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "🌲 目录树"},
-                    "type": "default",
-                    "behaviors": [{"type": "callback", "value": {"action": "menu_tree"}}]
-                }]
-            },
-            {
-                "tag": "column",
-                "width": "weighted",
-                "weight": 1,
-                "elements": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "🔄 刷新"},
-                    "type": "default",
-                    "behaviors": [{"type": "callback", "value": {"action": "menu_open"}}]
-                }]
-            },
-        ]
+            {"tag": "column", "width": "auto", "elements": [{
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "📂 文件列表"},
+                "type": "default",
+                "width": "default",
+                "behaviors": [{"type": "callback", "value": {"action": "menu_ls"}}],
+            }]},
+            {"tag": "column", "width": "auto", "elements": [{
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "🌲 目录树"},
+                "type": "default",
+                "width": "default",
+                "behaviors": [{"type": "callback", "value": {"action": "menu_tree"}}],
+            }]},
+            {"tag": "column", "width": "auto", "elements": [{
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "🔄 刷新"},
+                "type": "default",
+                "width": "default",
+                "behaviors": [{"type": "callback", "value": {"action": "menu_open"}}],
+            }]},
+        ],
     })
 
-    from .shared_memory_poller import notify_mode_label
+    # ── Section 3: 偏好 ──
+    elements.append({"tag": "hr"})
+    elements.append({"tag": "markdown", "content": "**偏好**"})
+
     notify_enabled = notify_mode != "off"
-    notify_icon = "🔕" if not notify_enabled else "🔔"
-    notify_label = f"{notify_icon} 完成通知: {notify_mode_label(notify_mode)}"
-    if not notify_enabled:
-        urgent_label = "🔇 加急通知: 关"
-        urgent_button: Dict[str, Any] = {
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": urgent_label},
-            "type": "default",
-            "disabled": True,
-        }
-    elif urgent_enabled:
-        urgent_label = "🔔 加急通知: 开"
-        urgent_button = {
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": urgent_label},
-            "type": "default",
-            "behaviors": [{"type": "callback", "value": {"action": "menu_toggle_urgent"}}]
-        }
-    else:
-        urgent_label = "🔕 加急通知: 关"
-        urgent_button = {
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": urgent_label},
-            "type": "default",
-            "behaviors": [{"type": "callback", "value": {"action": "menu_toggle_urgent"}}]
-        }
-    elements.append({
-        "tag": "column_set",
-        "flex_mode": "none",
-        "columns": [
-            {
-                "tag": "column",
-                "width": "weighted",
-                "weight": 1,
-                "elements": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": notify_label},
-                    "type": "default",
-                    "behaviors": [{"type": "callback", "value": {"action": "menu_toggle_notify"}}]
-                }]
-            },
-            {
-                "tag": "column",
-                "width": "weighted",
-                "weight": 1,
-                "elements": [urgent_button]
-            },
-        ]
-    })
+    notify_value_text = notify_mode_label(notify_mode)
+    notify_color = "grey" if not notify_enabled else "blue"
+    elements.append(_toggle_row(
+        label="完成通知",
+        value_text=notify_value_text,
+        value_color=notify_color,
+        action="menu_toggle_notify",
+    ))
 
-    bypass_label = "🔓 新会话bypass: 开" if bypass_enabled else "🔒 新会话bypass: 关"
-    elements.append({
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": bypass_label},
-        "type": "default",
-        "behaviors": [{"type": "callback", "value": {"action": "menu_toggle_bypass"}}]
-    })
+    urgent_value_text = "开" if urgent_enabled else "关"
+    elements.append(_toggle_row(
+        label="加急通知",
+        value_text=urgent_value_text,
+        value_color="red" if urgent_enabled else "grey",
+        action="menu_toggle_urgent",
+        disabled=not notify_enabled,
+    ))
+
+    bypass_value_text = "开" if bypass_enabled else "关"
+    elements.append(_toggle_row(
+        label="新会话 bypass",
+        value_text=bypass_value_text,
+        value_color="orange" if bypass_enabled else "grey",
+        action="menu_toggle_bypass",
+    ))
 
     return {
         "schema": "2.0",
         "config": {"wide_screen_mode": True},
-        "header": _build_header("⚡ 快捷操作", "turquoise"),
-        "body": {"elements": elements}
+        "header": _build_header("⚡ 快捷操作", "turquoise", show_subtitle=False),
+        "body": {"elements": elements},
     }

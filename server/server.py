@@ -10,7 +10,6 @@ Proxy Server
 
 import asyncio
 import atexit
-import hashlib
 import logging
 import os
 import pty
@@ -95,86 +94,60 @@ class _VirtualCursor:
         self.y = y
 
 
-def _dedup_block_id(b) -> str:
-    """计算 block 的稳定 ID（首行内容作为 key），与 shared_state._block_id_from_dict 对齐。
+def _dedup_full_content(b) -> str:
+    """返回 block 的完整内容签名（用于邻接合并判定）。
 
-    若首行为空（理论不会从 parser 出现），返回 "" 表示不参与 block_id 去重，避免
-    所有空 OutputBlock 被折叠成一个。
+    - 仅对累积型 Block 生效：OutputBlock / UserInput / PlanBlock / SystemBlock
+    - 返回空串表示"不参与合并"（空 block、未知类型），避免错误塌缩
+    - 签名使用整块字节内容。只有 Ink 把同一整屏再次写入 buffer、旧副本刚好遗留
+      在 history.top 相邻位置时才会命中；两段历史中首行偶然相同的独立 block 因
+      正文不同，签名不同，不会被合并
     """
     from utils.components import OutputBlock, UserInput, PlanBlock, SystemBlock
 
-    if isinstance(b, UserInput):
-        first = (b.text or "").split('\n', 1)[0][:80]
-        return f"U:{first}" if first else ""
     if isinstance(b, OutputBlock):
-        first = (b.content or "").split('\n', 1)[0].strip()[:80]
-        return f"O:{first}" if first else ""
+        return (b.content or "").strip()
+    if isinstance(b, UserInput):
+        return (b.text or "").strip()
     if isinstance(b, PlanBlock):
-        title = (b.title or "")[:80]
-        return f"PL:{title}" if title else ""
+        title = (b.title or "").strip()
+        body = (b.content or "").strip()
+        sig = f"{title}\n{body}".strip()
+        return sig if sig else ""
     if isinstance(b, SystemBlock):
-        first = (b.content or "").split('\n', 1)[0].strip()[:80]
-        return f"S:{first}" if first else ""
+        return (b.content or "").strip()
     return ""
 
 
-def _dedup_content_hash(b) -> str:
-    """计算 OutputBlock 的正文 hash（捕获首行因动画微调但正文一致的 Ink 重绘副本）。
-
-    仅对 OutputBlock 生效，且只在存在 ≥2 行正文时 hash 首行之后的内容 —— 这样 Ink 在首行
-    追加 spinner / 进度数字等微调时，body 不变仍会被识别为同一 block；单行 block 跳过 pass 2，
-    避免跟 pass 1 重复判定。
-    """
-    from utils.components import OutputBlock
-    if not isinstance(b, OutputBlock):
-        return ""
-    content = (b.content or "").strip()
-    if '\n' not in content:
-        return ""  # 单行 block 完全由 pass 1 负责，pass 2 不再兜底
-    body = content.split('\n', 1)[1].strip()
-    if not body:
-        return ""
-    return hashlib.sha1(body.encode('utf-8', errors='replace')).hexdigest()
-
-
 def _dedup_blocks(blocks: list) -> list:
-    """去除 Ink 整屏重绘造成的 block 重复副本。
+    """合并 Ink 整屏重绘造成的 **相邻** block 副本。
 
-    Claude CLI 等 Ink 框架会做整屏重绘；当输出超过 PTY_ROWS 时，旧渲染会被滚进
-    HistoryScreen.history.top，新渲染落回 screen.buffer，导致 VirtualScreen 同时暴露
-    同一个 block 的多份拷贝。此函数做两轮去重，每个 key 只保留最后一次出现：
+    场景：Ink 框架更新状态时会清屏并重新写入整屏内容。当输出超过 PTY_ROWS 时，
+    旧渲染被挤进 HistoryScreen.history.top，新渲染落回 screen.buffer。VirtualScreen
+    把两者拼起来后，同一整屏的 block 会紧邻出现两次（甚至多次）。
 
-    - Pass 1 按 block_id（首行内容）去重
-    - Pass 2 按 OutputBlock 正文 hash 兜底
+    策略（保守）：
+      - 只合并「紧邻 + 类型相同 + 整块内容字节一致」的 block
+      - 跨越其它 block 的重复（例如用户两次请求产生首行相同的回复）一律保留
+      - 合并时用后者（最新渲染）覆盖前者的位置，保持 start_row 反映最新
+
+    不做的事（避免误杀合法历史）：
+      - 不按首行做全局去重：两个独立对话轮次的回复偶然以相同句子开头是正常的
+      - 不按内容 hash 跨块去重：同样会误杀"内容相同但不相邻"的合法重复
     """
     if len(blocks) < 2:
         return blocks
 
-    # Pass 1：按 block_id 只保留最后一次出现（倒序扫描 + 反转）
-    seen_ids: set = set()
-    pass1 = []
-    for b in reversed(blocks):
-        bid = _dedup_block_id(b)
-        if bid and bid in seen_ids:
-            continue
-        if bid:
-            seen_ids.add(bid)
-        pass1.append(b)
-    pass1.reverse()
-
-    # Pass 2：按 OutputBlock 正文 hash 只保留最后一次
-    seen_hashes: set = set()
-    pass2 = []
-    for b in reversed(pass1):
-        h = _dedup_content_hash(b)
-        if h and h in seen_hashes:
-            continue
-        if h:
-            seen_hashes.add(h)
-        pass2.append(b)
-    pass2.reverse()
-
-    return pass2
+    result: list = []
+    for b in blocks:
+        if result:
+            sig = _dedup_full_content(b)
+            if sig and type(result[-1]) is type(b) and _dedup_full_content(result[-1]) == sig:
+                # 相邻 + 同类型 + 整块字节一致 → 用后者覆盖，保留最新位置
+                result[-1] = b
+                continue
+        result.append(b)
+    return result
 
 
 class VirtualScreen:
@@ -243,6 +216,7 @@ class ClaudeWindow:
     timestamp: float = 0.0
     layout_mode: str = "normal"  # "normal" | "option" | "detail" | "agent_list" | "agent_detail"
     cli_type: str = "claude"     # "claude" | "codex" | "agent"（决定 lark 侧的标题文案与 parser）
+    resume_target: str = ""      # CLI 的 --resume 目标（如 remote-claude-dev）
 
 
 
@@ -258,12 +232,14 @@ class OutputWatcher:
     def __init__(self, session_name: str, cols: int, rows: int,
                  parser=None,
                  cli_type: str = "claude",
+                 resume_target: str = "",
                  on_snapshot=None, debug_screen: bool = False,
                  debug_verbose: bool = False):
         self._session_name = session_name
         self._cols = cols
         self._rows = rows
         self._cli_type = cli_type
+        self._resume_target = resume_target
         self._pending = False
         self._on_snapshot = on_snapshot  # 回调：写共享内存
         self._debug_screen = debug_screen  # --debug-screen 开启后才写 _screen.log
@@ -519,6 +495,7 @@ class OutputWatcher:
                 timestamp=now,
                 layout_mode=self._parser.last_layout_mode,
                 cli_type=self._cli_type,
+                resume_target=self._resume_target,
             )
             # 诊断日志：检测最终输出中是否有同时存在 status_line 和 SystemBlock 的情况
             if display_status:
@@ -892,6 +869,18 @@ class ClientConnection:
 class ProxyServer:
     """Proxy Server"""
 
+    @staticmethod
+    def _extract_resume_target(argv: list[str]) -> str:
+        """从底层 CLI 参数中提取 `--resume` 目标。"""
+        if not argv:
+            return ""
+        for i, arg in enumerate(argv):
+            if arg == "--resume" and i + 1 < len(argv):
+                return argv[i + 1].strip()
+            if arg.startswith("--resume="):
+                return arg.split("=", 1)[1].strip()
+        return ""
+
     def __init__(self, session_name: str, claude_args: list = None,
                  claude_cmd: str = "claude", codex_cmd: str = "codex",
                  agent_cmd: str = "agent",
@@ -903,6 +892,7 @@ class ProxyServer:
         self.codex_cmd = codex_cmd
         self.agent_cmd = agent_cmd
         self.cli_type = cli_type
+        self.resume_target = self._extract_resume_target(self.claude_args)
         self.debug_screen = debug_screen
         self.debug_verbose = debug_verbose
         self.socket_path = get_socket_path(session_name)
@@ -928,6 +918,7 @@ class ProxyServer:
             cols=self.PTY_COLS, rows=self.PTY_ROWS,
             parser=self._get_parser(),
             cli_type=self.cli_type,
+            resume_target=self.resume_target,
             on_snapshot=lambda w: self.shared_state.write_snapshot(w),
             debug_screen=self.debug_screen,
             debug_verbose=self.debug_verbose,

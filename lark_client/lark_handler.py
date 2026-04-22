@@ -30,6 +30,7 @@ from .card_builder import (
     build_dir_card,
     build_menu_card,
 )
+from .group_naming import build_group_chat_name
 from .shared_memory_poller import SharedMemoryPoller, CardSlice
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -494,6 +495,52 @@ class LarkHandler:
         finally:
             self._starting_sessions.discard(session_name)
 
+    async def _cmd_kill_confirm(self, user_id: str, chat_id: str, session_name: str):
+        """关闭会话前的确认步骤（对应 overflow 菜单的「关闭会话」）
+
+        飞书卡片的 overflow 组件不支持原生 confirm 弹窗，所以这里走服务端路径：
+        先推一张小卡片列出被关闭的会话名，配两个按钮：确认关闭 / 取消。
+        用户点「确认关闭」后才真正分发 list_kill。
+        """
+        if not session_name:
+            return
+        card = {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "⚠️ 确认关闭会话"},
+                "template": "red",
+            },
+            "body": {"elements": [
+                {"tag": "markdown",
+                 "content": f"即将关闭「**{session_name}**」。\n\n<font color='grey'>此操作不可撤销，会话内运行的进程将被终止；若存在绑定群聊，会被自动解散。</font>"},
+                {"tag": "column_set",
+                 "flex_mode": "flow",
+                 "horizontal_spacing": "small",
+                 "columns": [
+                     {"tag": "column", "width": "auto", "elements": [{
+                         "tag": "button",
+                         "text": {"tag": "plain_text", "content": "确认关闭"},
+                         "type": "danger",
+                         "width": "default",
+                         "behaviors": [{"type": "callback", "value": {
+                             "action": "list_kill", "session": session_name,
+                         }}],
+                     }]},
+                     {"tag": "column", "width": "auto", "elements": [{
+                         "tag": "button",
+                         "text": {"tag": "plain_text", "content": "取消"},
+                         "type": "default",
+                         "width": "default",
+                         "behaviors": [{"type": "callback", "value": {"action": "menu_open"}}],
+                     }]},
+                 ]},
+            ]},
+        }
+        card_id = await card_service.create_card(card)
+        if card_id:
+            await card_service.send_card(chat_id, card_id)
+
     async def _cmd_kill(self, user_id: str, chat_id: str, args: str,
                         message_id: Optional[str] = None):
         """终止会话"""
@@ -756,16 +803,21 @@ class LarkHandler:
         session = next((s for s in sessions if s["name"] == session_name), None)
         pid = session.get("pid") if session else None
         cwd = self._get_pid_cwd(pid) if pid else None
-        from .card_builder import _get_display_name
-        dir_label = _get_display_name(session_name, cwd)
+        cli_type = (session or {}).get("cli_type", "claude")
+        resume_target = (session or {}).get("resume_target", "")
+        start_time = (session or {}).get("start_time", "")
 
         from . import config
         try:
             import json as _json
             import urllib.request
-            import datetime
-            _time_str = datetime.datetime.now().strftime("%H-%M")
-            group_name = f"{config.GROUP_NAME_PREFIX}{dir_label}-{_time_str}"
+            group_name = build_group_chat_name(
+                cli_type=cli_type,
+                cwd=cwd,
+                session_name=session_name,
+                resume_target=resume_target,
+                start_time=start_time,
+            )
             req_body = {
                 "name": group_name,
                 "description": f"Remote Claude 专属群 - 会话 {session_name}",
