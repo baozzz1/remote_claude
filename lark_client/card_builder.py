@@ -1266,6 +1266,8 @@ def build_help_card() -> Dict[str, Any]:
 
 **群聊协作**
 • `/new-group <会话名>` - 创建专属群聊，多人共用同一 Claude
+• `/refresh-avatar` - 刷新当前群头像（按绑定会话 cli_type 上传品牌图标）
+• `/refresh-avatar all` - 重新上传全部 CLI 图标并同步到所有专属群
 
 **按键控制**
 • `/press <按键>` - 发送按键到会话（如 `/press ctrl+c`、`/press esc`、`/press ctrl+f`）

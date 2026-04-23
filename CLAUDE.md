@@ -43,6 +43,7 @@ client.py  SessionBridge (lark_client/)
 - `session_bridge.py` — 连接 Unix Socket，**仅负责输入发送**（send_input/send_key）和连接管理
 - `shared_memory_poller.py` — **流式滚动卡片轮询器**：每秒轮询 `.mq` 共享内存，通过 hash diff 驱动 `CardSlice`/`StreamTracker` 就地更新或冻结+开新卡
 - `card_builder.py` — **`build_stream_card(blocks, status_line, bottom_bar, is_frozen, agent_panel, option_block, session_name, disconnected)`**：四层结构卡片构建（内容区/状态区/交互区/菜单）+ 辅助卡片（session_list/menu/help/dir 等）
+- `avatar_uploader.py` — 群头像管理：按 `cli_type`（claude/codex/agent）上传 `lark_client/assets/icons/*.png` 到飞书 `im/v1/images`（`image_type=avatar`），返回的 `image_key` 缓存到 `~/.remote-claude/lark_avatar_keys.json`。`_cmd_new_group` 会在建群 body 里带 `avatar=image_key`；`/refresh-avatar` 命令支持手动刷新单个群或批量刷新全部群（`/refresh-avatar all`）
 - `card_service.py` — 飞书卡片 API 服务（create/update/send）
 - `rich_text_renderer.py` — 持久化 pyte Screen 封装（server 端实时喂入）
 
@@ -711,6 +712,8 @@ remote_claude/
 │   ├── main.py                 # WebSocket 入口
 │   ├── lark_handler.py         # 命令路由（群聊/私聊统一逻辑）
 │   ├── session_bridge.py       # Unix Socket 桥接（仅输入发送）
+│   ├── avatar_uploader.py      # 群头像上传（cli_type → image_key，本地缓存）
+│   ├── assets/icons/           # 品牌图标：claude.png / codex.png / cursor.png
 │   ├── shared_memory_poller.py # 流式滚动卡片轮询器（CardSlice/StreamTracker）
 │   ├── card_builder.py         # 卡片构建（build_stream_card + 辅助卡片）
 │   ├── card_service.py         # 卡片更新服务
@@ -726,6 +729,7 @@ remote_claude/
 │   ├── test_stream_poller.py   # 流式卡片模型单元测试（card_builder + poller）
 │   ├── test_dedup_blocks.py    # Ink 重绘副本合并单元测试（相邻 + 全内容一致）
 │   ├── test_agent_parser.py    # Cursor Agent 解析器单元测试（▄/▀ 边框、2 空格 indent、→ prompt）
+│   ├── test_avatar_uploader.py # 群头像上传器单元测试（图标映射、缓存命中、force 刷新）
 │   ├── test_notify_mode.py     # 完成通知模式与冷却回归测试
 │   ├── test_integration.py     # 集成测试
 │   ├── test_attach_dedup.py
@@ -805,6 +809,7 @@ uv run python3 tests/test_format_unit.py                  # 格式化逻辑单�
 uv run python3 tests/test_stream_poller.py                # 流式卡片模型测试（card_builder + poller）
 uv run python3 tests/test_dedup_blocks.py                 # Ink 重绘副本合并测试（server._dedup_blocks）
 uv run python3 tests/test_agent_parser.py                 # Cursor Agent 解析器测试（▄/▀ 边框、indent、→ prompt）
+uv run python3 tests/test_avatar_uploader.py              # 群头像上传器测试（图标映射、缓存命中、force 刷新）
 uv run python3 tests/test_notify_mode.py                  # 通知模式与跨任务冷却测试
 uv run python3 tests/test_renderer.py                     # 终端渲染器测试
 uv run python3 tests/test_output_clean.py                 # 输出清理器测试

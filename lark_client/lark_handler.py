@@ -265,6 +265,8 @@ class LarkHandler:
             await self._cmd_ls(user_id, chat_id, args, tree=(command == "/tree"))
         elif command == "/new-group":
             await self._cmd_new_group(user_id, chat_id, args)
+        elif command in ("/refresh-avatar", "/refresh-icon"):
+            await self._cmd_refresh_avatar(user_id, chat_id, args)
         elif command == "/help":
             await self._cmd_help(user_id, chat_id)
         elif command == "/menu":
@@ -823,6 +825,15 @@ class LarkHandler:
                 "description": f"Remote Claude 专属群 - 会话 {session_name}",
                 "user_id_list": [user_id],
             }
+            # 附加 cli_type 对应的品牌头像（失败不影响建群）
+            try:
+                from . import avatar_uploader
+                avatar_key = await avatar_uploader.get_avatar_image_key(cli_type)
+                if avatar_key:
+                    req_body["avatar"] = avatar_key
+            except Exception as _e:
+                logger.warning(f"获取 {cli_type} 头像 image_key 失败，跳过: {_e}")
+
             token_resp = urllib.request.urlopen(
                 urllib.request.Request(
                     "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
@@ -861,6 +872,121 @@ class LarkHandler:
         except Exception as e:
             logger.error(f"创建群失败: {e}")
             await card_service.send_text(chat_id, f"创建群失败：{e}")
+
+    async def _update_chat_avatar_via_api(
+        self, group_chat_id: str, avatar_key: str
+    ) -> tuple:
+        """PUT /open-apis/im/v1/chats/{chat_id} 更新群头像，返回 (ok, err_msg)"""
+        import json as _json
+        import urllib.request
+        import urllib.error
+        from . import config
+        try:
+            token_resp = urllib.request.urlopen(
+                urllib.request.Request(
+                    "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                    data=_json.dumps({
+                        "app_id": config.FEISHU_APP_ID,
+                        "app_secret": config.FEISHU_APP_SECRET,
+                    }).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                ), timeout=10,
+            )
+            token = _json.loads(token_resp.read())["tenant_access_token"]
+            try:
+                upd_resp = urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"https://open.feishu.cn/open-apis/im/v1/chats/{group_chat_id}",
+                        data=_json.dumps({"avatar": avatar_key}).encode(),
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {token}",
+                        },
+                        method="PUT",
+                    ), timeout=10,
+                )
+                upd_data = _json.loads(upd_resp.read())
+                if upd_data.get("code") == 0:
+                    return True, ""
+                return False, upd_data.get("msg", "")
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode("utf-8", errors="replace")
+                try:
+                    err_data = _json.loads(err_body)
+                    return False, f"code={err_data.get('code')} {err_data.get('msg', '')}"
+                except Exception:
+                    return False, f"HTTP {e.code}"
+        except Exception as e:
+            return False, str(e)
+
+    async def _cmd_refresh_avatar(self, user_id: str, chat_id: str, args: str,
+                                   message_id: Optional[str] = None):
+        """刷新群头像。
+
+        用法：
+          /refresh-avatar            — 刷新当前群（按绑定会话 cli_type 重新上传并更新）
+          /refresh-avatar all        — 强制重新上传全部 CLI 图标并更新所有专属群
+        """
+        from . import avatar_uploader
+        mode = (args or '').strip().lower()
+
+        if mode == 'all':
+            # 重新上传所有 cli_type 图标（force=True），再挨个更新绑定群
+            keys = await avatar_uploader.refresh_all()
+            updated = 0
+            failed = []
+            for cid in list(self._group_chat_ids):
+                sess_name = self._chat_bindings.get(cid)
+                sess = next((s for s in list_active_sessions()
+                             if s["name"] == sess_name), None) if sess_name else None
+                cli_type = (sess or {}).get('cli_type', 'claude')
+                key = keys.get(cli_type)
+                if not key:
+                    failed.append(f"{cid[:8]}… ({cli_type} 未上传)")
+                    continue
+                ok, err = await self._update_chat_avatar_via_api(cid, key)
+                if ok:
+                    updated += 1
+                else:
+                    failed.append(f"{cid[:8]}… ({err})")
+            msg_lines = [
+                f"✅ 已为 {updated} 个群更新头像"
+            ]
+            if failed:
+                msg_lines.append("失败 " + str(len(failed)) + " 个：")
+                msg_lines.extend("  · " + s for s in failed[:10])
+            await card_service.send_text(chat_id, "\n".join(msg_lines))
+            return
+
+        # 默认模式：刷新当前群
+        if chat_id not in self._group_chat_ids:
+            await card_service.send_text(
+                chat_id,
+                "此命令仅在专属群内使用。用 /refresh-avatar all 可刷新全部群；"
+                "或先 /new-group 创建专属群。"
+            )
+            return
+        session_name = self._chat_bindings.get(chat_id)
+        if not session_name:
+            await card_service.send_text(chat_id, "当前群未绑定会话，无法确定图标类型")
+            return
+        sess = next((s for s in list_active_sessions()
+                     if s["name"] == session_name), None)
+        cli_type = (sess or {}).get('cli_type', 'claude')
+
+        key = await avatar_uploader.get_avatar_image_key(cli_type, force=True)
+        if not key:
+            await card_service.send_text(
+                chat_id,
+                f"上传 {cli_type} 图标失败，请检查 lark_client/assets/icons/ 下是否有对应 PNG"
+            )
+            return
+        ok, err = await self._update_chat_avatar_via_api(chat_id, key)
+        if ok:
+            await card_service.send_text(chat_id, f"✅ 已更新为 {cli_type} 头像")
+        else:
+            await card_service.send_text(chat_id, f"更新群头像失败：{err}")
 
     async def _disband_group_via_api(self, group_chat_id: str) -> tuple:
         """调用飞书 API 解散群聊，返回 (ok: bool, err_msg: str)"""
