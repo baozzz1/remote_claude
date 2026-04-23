@@ -774,7 +774,18 @@ def cmd_lark_refresh_avatar(args):
                 continue
             if chat_only and cid != chat_only:
                 continue
-            cli_type = (sessions.get(sess_name) or {}).get("cli_type", "claude")
+            sess = sessions.get(sess_name)
+            if sess:
+                cli_type = sess.get("cli_type", "claude")
+            else:
+                # 会话已结束，回退查询群名 `[cli]` 前缀（GET /im/v1/chats/{id}）
+                inferred = await avatar_uploader.infer_cli_type_from_chat(cid)
+                if inferred:
+                    cli_type = inferred
+                    print(f"  (会话已结束，按群名推断 {cid[:12]}… → {cli_type})")
+                else:
+                    cli_type = "claude"
+                    print(f"  ⚠ 无法推断 {cid[:12]}… ({sess_name}) 的 cli_type，默认 claude")
             targets.append((cid, sess_name, cli_type))
 
         if not targets:

@@ -940,7 +940,11 @@ class LarkHandler:
                 sess_name = self._chat_bindings.get(cid)
                 sess = next((s for s in list_active_sessions()
                              if s["name"] == sess_name), None) if sess_name else None
-                cli_type = (sess or {}).get('cli_type', 'claude')
+                if sess:
+                    cli_type = sess.get('cli_type', 'claude')
+                else:
+                    # 会话已结束，按群名 `[cli]` 前缀推断
+                    cli_type = await avatar_uploader.infer_cli_type_from_chat(cid) or 'claude'
                 key = keys.get(cli_type)
                 if not key:
                     failed.append(f"{cid[:8]}… ({cli_type} 未上传)")
@@ -973,7 +977,10 @@ class LarkHandler:
             return
         sess = next((s for s in list_active_sessions()
                      if s["name"] == session_name), None)
-        cli_type = (sess or {}).get('cli_type', 'claude')
+        if sess:
+            cli_type = sess.get('cli_type', 'claude')
+        else:
+            cli_type = await avatar_uploader.infer_cli_type_from_chat(chat_id) or 'claude'
 
         key = await avatar_uploader.get_avatar_image_key(cli_type, force=True)
         if not key:

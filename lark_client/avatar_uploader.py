@@ -20,10 +20,13 @@ import logging
 from pathlib import Path
 from typing import Dict, Optional
 
+import re
+
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
     CreateImageRequest, CreateImageRequestBody,
     UpdateChatRequest, UpdateChatRequestBody,
+    GetChatRequest,
 )
 
 from . import config
@@ -36,6 +39,14 @@ _ICON_FILE_BY_CLI: Dict[str, str] = {
     'claude': 'claude.png',
     'codex':  'codex.png',
     'agent':  'cursor.png',
+}
+
+# 群名首部 [cli_label] → cli_type（与 group_naming._GROUP_NAME_CLI_LABELS 保持一致）
+_GROUP_NAME_PREFIX_RE = re.compile(r'^\s*\[(?P<label>[a-zA-Z]+)\]')
+_LABEL_TO_CLI_TYPE: Dict[str, str] = {
+    'claude': 'claude',
+    'codex':  'codex',
+    'cursor': 'agent',
 }
 
 
@@ -150,6 +161,41 @@ async def get_avatar_image_key(cli_type: str, force: bool = False) -> Optional[s
     cache[cli_type] = key
     _save_cache(cache)
     return key
+
+
+def _get_chat_name_sync(chat_id: str) -> Optional[str]:
+    """GET /im/v1/chats/{chat_id} 取群名；失败返回 None"""
+    client = _get_client()
+    if client is None:
+        return None
+    try:
+        req = GetChatRequest.builder().chat_id(chat_id).build()
+        resp = client.im.v1.chat.get(req)
+    except Exception as e:
+        logger.warning(f"GET chat {chat_id[:12]}… 失败: {e}")
+        return None
+    if not resp.success():
+        logger.warning(f"GET chat {chat_id[:12]}… failed: code={resp.code} msg={resp.msg}")
+        return None
+    return getattr(resp.data, 'name', None)
+
+
+def cli_type_from_group_name(name: str) -> Optional[str]:
+    """从群名首部 `[claude] …` / `[codex] …` / `[cursor] …` 推断 cli_type"""
+    if not name:
+        return None
+    m = _GROUP_NAME_PREFIX_RE.match(name)
+    if not m:
+        return None
+    return _LABEL_TO_CLI_TYPE.get(m.group('label').lower())
+
+
+async def infer_cli_type_from_chat(chat_id: str) -> Optional[str]:
+    """当会话已结束、无法从 list_active_sessions 取 cli_type 时，
+    通过 Lark API 取群名并解析 `[cli]` 前缀。"""
+    loop = asyncio.get_event_loop()
+    name = await loop.run_in_executor(None, _get_chat_name_sync, chat_id)
+    return cli_type_from_group_name(name or '')
 
 
 def _update_chat_avatar_sync(chat_id: str, avatar_key: str) -> tuple:

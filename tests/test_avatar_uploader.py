@@ -122,5 +122,44 @@ class TestRefreshAll(unittest.TestCase):
         self.assertEqual(result['agent'], 'key_for_agent')
 
 
+class TestCliTypeFromGroupName(unittest.TestCase):
+    """校验从群名前缀推断 cli_type（会话结束后的回退路径）"""
+
+    def test_claude_prefix(self):
+        self.assertEqual(
+            avatar_uploader.cli_type_from_group_name('[claude] path session'),
+            'claude'
+        )
+
+    def test_codex_prefix(self):
+        self.assertEqual(
+            avatar_uploader.cli_type_from_group_name('[codex] some/path abc'),
+            'codex'
+        )
+
+    def test_cursor_prefix_maps_to_agent(self):
+        """[cursor] 是群名里的 label，cli_type 应该是 agent"""
+        self.assertEqual(
+            avatar_uploader.cli_type_from_group_name('[cursor] foo bar'),
+            'agent'
+        )
+
+    def test_case_insensitive(self):
+        self.assertEqual(
+            avatar_uploader.cli_type_from_group_name('[Codex] X Y'),
+            'codex'
+        )
+
+    def test_no_prefix_returns_none(self):
+        self.assertIsNone(avatar_uploader.cli_type_from_group_name('some plain name'))
+        self.assertIsNone(avatar_uploader.cli_type_from_group_name(''))
+        self.assertIsNone(avatar_uploader.cli_type_from_group_name(None))
+
+    def test_unknown_label_returns_none(self):
+        self.assertIsNone(
+            avatar_uploader.cli_type_from_group_name('[gemini] path session')
+        )
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
