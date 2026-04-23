@@ -29,7 +29,7 @@ client.py  SessionBridge (lark_client/)
 - `server/server.py` — PTY 代理服务器，`pty.fork()` 启动 Claude/Codex，asyncio Unix Socket 广播输出
 - `server/parsers/claude_parser.py` — Claude CLI 终端输出解析（区域切分、Block 分类、执行状态判断）
 - `server/parsers/codex_parser.py` — Codex CLI 终端输出解析（无分割线、`›` 提示符、背景色区域检测）
-- `server/parsers/agent_parser.py` — Cursor Agent CLI 解析器，直接继承 `CodexParser`（Cursor 与 Codex 同属 Ink TUI，复用同一套解析逻辑；后续如需 Cursor 专属差异在此子类覆盖）
+- `server/parsers/agent_parser.py` — Cursor Agent CLI 解析器。虽然 Cursor 与 Codex 同属 Ink TUI，但实际 UI 差异很大（所有内容整体右缩进 2 格、输入框用 `▄`/`▀` 半块字符 + fg=#808080 灰色画边而非 pyte bg 属性、输入提示符为 `→` 而非 `›`、输出内容无圆点/星号首列指示字符），因此完全 override `parse()`，用 Cursor 专属路径：▄/▀ 定位输入框 → 剩余区域按欢迎/输出/输入/底部栏切分 → 输出区按空行切成 `OutputBlock` 并剥离 2 空格左缩进。仅复用 CodexParser 的 `__init__` 缓存字段与工具函数。
 - `server/component_parser.py` — 向后兼容 shim（实际实现在 `server/parsers/`）
 - `server/shared_state.py` — 共享内存写入（`.mq` 文件）
 - `client/client.py` — 终端客户端，raw mode 输入转发
@@ -595,6 +595,72 @@ Pass 1 算法（`_find_bg_region`）：从下往上找连续 bg zone → zone �
 
 > Codex 与 Claude Code 的核心区别：Claude Code 用**不同字符**区分（星星=StatusLine，圆点=OutputBlock），Codex 用**同一圆点字符 + blink 属性**区分。
 
+---
+
+**Cursor Agent CLI 终端输出解析规则（`server/parsers/agent_parser.py`）：**
+
+Cursor Agent 虽然和 Codex 同为 Ink 框架，但 UI 设计差异很大，必须由 `AgentParser` 独立处理，不能复用 `CodexParser._split_regions`。
+
+### Cursor Agent 终端布局（实测）
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                                                         │  ← 上方留空
+│   Cursor Agent                                          │  ← 标题（col=2）
+│   v2026.04.17-787b533                                   │  ← 版本号（紧跟标题，会被 trim）
+│                                                         │
+│   say hi in one short sentence                          │  ← 用户输入回显（col=2，fg=#808080）
+│                                                         │
+│                                                         │
+│   Hi there — I'm here and ready to help.                │  ← agent 回复（col=2，fg=#808080）
+│                                                         │
+│   ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄...▄▄▄▄  │  ← 输入框上边框（半块字符 fg=#808080）
+│   → Add a follow-up                                     │  ← 输入行（→ U+2192，col=2）
+│   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀...▀▀▀▀  │  ← 输入框下边框（半块字符 fg=#808080）
+│   Composer 2 Fast · 5.2%                                │  ← 底部栏：模型 + 使用率
+│   /private/tmp                                          │  ← 底部栏：cwd
+└─────────────────────────────────────────────────────────┘
+```
+
+**首启动还会出现 `╭───╮` Workspace Trust Required 对话框**（col=2 起的 box-drawing 框），在信任之前没有输入框。
+
+### 与 Claude / Codex 的关键差异
+
+| 特性 | Claude Code | Codex | Cursor Agent |
+|------|-------------|-------|--------------|
+| 内容缩进 | col=0 起 | col=0 起 | **所有内容整体右缩进 2 列**，col=0/1 恒为空格 |
+| 区域分割 | `─━═` 分割线 | 连续背景色 zone + 纯背景色首尾边界 | **▄/▀ 半块字符 + fg=#808080 画出的输入框**（非 pyte bg 属性） |
+| 输入提示符 | `❯` (U+276F) | `›` (U+203A) | **`→` (U+2192)** |
+| 输出指示字符 | `●` / `⏺` | `•` | **无**，纯文本渲染（fg=#808080 灰色） |
+| StatusLine | 星星字符 blink | 圆点字符 blink | 暂未识别（本版本不处理） |
+
+### Cursor Agent 区域切分策略（`_find_input_box`）
+
+从 `cursor.y+5` 向上扫描：
+1. 找到第一个连续 ≥10 个 `▀` 字符的行 → 输入框下边框 `bot_border`
+2. 从 `bot_border - 1` 向上最多 20 行，找到连续 ≥10 个 `▄` 字符的行 → 输入框上边框 `top_border`
+3. 两个边框都找到 → 上方 = 输出区，两框之间 = input_rows，下方（最多 4 行）= bottom_rows
+
+若未找到成对边框（如首启动 Trust 对话框尚未关闭），则整个可见范围全部作为 output_rows 走 `_trim_cursor_welcome` 路径，最终产出 0 block（欢迎框被整块丢弃）。
+
+### Cursor Agent 欢迎区识别（`_trim_cursor_welcome`）
+
+遍历 output_rows，丢弃以下内容：
+- 整行文本 `== "Cursor Agent"`：标题行
+- 紧随其后的 `v20...` 版本号行
+- 任意行首非空字符 ∈ `BOX_CORNER_TOP`（`╭` / `┌`）：整个 box 丢弃（含中间所有 `│` 行，直到匹配到 `BOX_CORNER_BOTTOM`）
+
+**注意：** 因为所有内容向右 indent 2 列，不能用 `_get_col0`（col=0 恒为空格），需要对 row 文本 `.strip()` 后再看首字符。
+
+### Cursor Agent 输出区分块（`_parse_output_indented`）
+
+Cursor Agent 的输出无圆点/星号等首列指示字符，每条消息是纯文本块，块之间用**空行分隔**（可能 1 行或多行空行）：
+- 遍历 output_rows，连续非空行归为一个 group，遇到空行则 flush 为一个 `OutputBlock`
+- 每行文本剥离最左 2 空格缩进（`if raw.startswith('  '): raw = raw[2:]`）
+- `block_id` 走 `OutputBlock` 默认前缀 `O:{首行}`
+
+本版本不区分"用户输入回显"和"agent 回复"，两者都产出 `OutputBlock`（后续如需精细区分，可按 bg 属性或位置推断）。本版本也不解析 StatusLine、OptionBlock、AgentPanelBlock 等状态型组件（Cursor Agent 暂未观察到这些场景的稳定样本）。
+
 ## 文件结构
 
 ```
@@ -608,7 +674,7 @@ remote_claude/
 │   │   ├── base_parser.py      # 解析器基类
 │   │   ├── claude_parser.py    # Claude CLI 解析器
 │   │   ├── codex_parser.py     # Codex CLI 解析器（背景色区域检测/›提示符/颜色模式区分）
-│   │   └── agent_parser.py     # Cursor Agent CLI 解析器（继承 CodexParser）
+│   │   └── agent_parser.py     # Cursor Agent CLI 解析器（▄/▀ 输入框定位、2 空格 indent 剥离、→ 提示符）
 │   ├── shared_state.py         # 共享内存写入（.mq 文件）
 │   └── rich_text_renderer.py   # 历史文件（暂保留）
 │
@@ -638,6 +704,7 @@ remote_claude/
 │   ├── test_component_parser.py
 │   ├── test_stream_poller.py   # 流式卡片模型单元测试（card_builder + poller）
 │   ├── test_dedup_blocks.py    # Ink 重绘副本合并单元测试（相邻 + 全内容一致）
+│   ├── test_agent_parser.py    # Cursor Agent 解析器单元测试（▄/▀ 边框、2 空格 indent、→ prompt）
 │   ├── test_notify_mode.py     # 完成通知模式与冷却回归测试
 │   ├── test_integration.py     # 集成测试
 │   ├── test_attach_dedup.py
@@ -716,6 +783,7 @@ uv run python3 remote_claude.py lark status    # 查看状态和日志
 uv run python3 tests/test_format_unit.py                  # 格式化逻辑单元测试（见 TEST_PLAN.md 层1）
 uv run python3 tests/test_stream_poller.py                # 流式卡片模型测试（card_builder + poller）
 uv run python3 tests/test_dedup_blocks.py                 # Ink 重绘副本合并测试（server._dedup_blocks）
+uv run python3 tests/test_agent_parser.py                 # Cursor Agent 解析器测试（▄/▀ 边框、indent、→ prompt）
 uv run python3 tests/test_notify_mode.py                  # 通知模式与跨任务冷却测试
 uv run python3 tests/test_renderer.py                     # 终端渲染器测试
 uv run python3 tests/test_output_clean.py                 # 输出清理器测试
