@@ -19,7 +19,7 @@ import pyte
 from pyte.screens import Char
 
 from server.parsers.agent_parser import AgentParser
-from utils.components import OutputBlock, BottomBar
+from utils.components import OutputBlock, BottomBar, StatusLine
 
 
 COLS = 220
@@ -189,6 +189,116 @@ class TestNoInputBoxFound(unittest.TestCase):
 
         self.assertEqual(len(output_blocks), 1)
         self.assertEqual(output_blocks[0].content, 'Some early message')
+
+
+class TestThinkingStatusLine(unittest.TestCase):
+    """思考/工具调用中：输出区尾部 braille spinner 行应解析为 StatusLine
+    而非 OutputBlock，否则 lark 卡片会把 header 显示为"就绪"。
+    """
+
+    def test_working_spinner_emits_status_line(self):
+        screen = _new_screen()
+        # 前面一段输出
+        _write(screen, 6, 2, 'say something', fg='808080')
+        # 空行
+        # spinner 行（col=1 braille 字符，fg=green）
+        _write(screen, 9, 1, '⠳⠀ Working', fg='green')
+        # 输入框：▄ 上边框 + → 输入 + ▀ 下边框
+        _write(screen, 10, 1, '▄' * 200, fg='151515')
+        _write(screen, 11, 2, '→ Add a follow-up')
+        _write(screen, 12, 1, '▀' * 200, fg='151515')
+        _write(screen, 13, 2, 'Composer 2 Fast · 5.2%')
+        _set_cursor(screen, 0, 14)
+
+        parser = AgentParser()
+        comps = parser.parse(screen)
+
+        status_lines = [c for c in comps if isinstance(c, StatusLine)]
+        output_blocks = [c for c in comps if isinstance(c, OutputBlock)]
+
+        self.assertEqual(len(status_lines), 1,
+                         f"expected 1 StatusLine, got components={[type(c).__name__ for c in comps]}")
+        sl = status_lines[0]
+        self.assertEqual(sl.action, 'Working')
+        self.assertTrue(sl.indicator and 0x2800 <= ord(sl.indicator) <= 0x28FF,
+                        f"indicator should be braille, got {sl.indicator!r}")
+
+        # spinner 行被剔除，不应作为 OutputBlock 出现
+        for b in output_blocks:
+            self.assertNotIn('Working', b.content)
+
+    def test_running_spinner_extracts_token_count(self):
+        screen = _new_screen()
+        _write(screen, 5, 2, '$ ls *.py', fg='808080')
+        _write(screen, 7, 1, '⠰⠃ Running  53 tokens', fg='green')
+        _write(screen, 8, 1, '▄' * 200, fg='151515')
+        _write(screen, 9, 2, '→')
+        _set_cursor(screen, 0, 10)
+
+        parser = AgentParser()
+        comps = parser.parse(screen)
+
+        status_lines = [c for c in comps if isinstance(c, StatusLine)]
+        self.assertEqual(len(status_lines), 1)
+        self.assertEqual(status_lines[0].action, 'Running')
+        self.assertEqual(status_lines[0].tokens, '53 tokens')
+
+    def test_optional_bottom_border(self):
+        """思考早期 ▀ 下边框可能缺失；input box 应仍然以 → 行为锚定位"""
+        screen = _new_screen()
+        _write(screen, 2, 2, 'some output line')
+        # spinner
+        _write(screen, 4, 1, '⠳⠀ Working', fg='green')
+        # 只有 ▄ 上边框，没有 ▀ 下边框
+        _write(screen, 5, 1, '▄' * 200, fg='151515')
+        _write(screen, 6, 2, '→')
+        _set_cursor(screen, 0, 7)
+
+        parser = AgentParser()
+        comps = parser.parse(screen)
+
+        status_lines = [c for c in comps if isinstance(c, StatusLine)]
+        output_blocks = [c for c in comps if isinstance(c, OutputBlock)]
+
+        self.assertEqual(len(status_lines), 1,
+                         "StatusLine should be detected even without bottom border")
+        self.assertEqual(len(output_blocks), 1)
+        self.assertEqual(output_blocks[0].content, 'some output line')
+
+    def test_no_spinner_when_idle(self):
+        """稳态（无 spinner）时不应生成 StatusLine"""
+        screen = _new_screen()
+        _write(screen, 2, 2, 'Hello response')
+        _write(screen, 4, 1, '▄' * 200, fg='808080')
+        _write(screen, 5, 2, '→ Add a follow-up')
+        _write(screen, 6, 1, '▀' * 200, fg='808080')
+        _set_cursor(screen, 0, 7)
+
+        parser = AgentParser()
+        comps = parser.parse(screen)
+
+        status_lines = [c for c in comps if isinstance(c, StatusLine)]
+        self.assertEqual(len(status_lines), 0,
+                         "no spinner → no StatusLine")
+
+
+class TestNonGreenBrailleIgnored(unittest.TestCase):
+    """非绿色的 braille 字符（罕见但可能出现在内容里）不应被当作 spinner"""
+
+    def test_grey_braille_not_spinner(self):
+        screen = _new_screen()
+        # 用户内容中包含 braille 字符但颜色是灰色
+        _write(screen, 2, 2, '⠿⠿⠿ some decorative braille', fg='808080')
+        _write(screen, 4, 1, '▄' * 200, fg='808080')
+        _write(screen, 5, 2, '→')
+        _set_cursor(screen, 0, 6)
+
+        parser = AgentParser()
+        comps = parser.parse(screen)
+
+        status_lines = [c for c in comps if isinstance(c, StatusLine)]
+        self.assertEqual(len(status_lines), 0,
+                         "grey braille is content decoration, not a spinner")
 
 
 if __name__ == '__main__':

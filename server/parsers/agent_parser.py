@@ -2,41 +2,46 @@
 
 Cursor Agent 二进制名为 `agent`，虽然同样基于 Ink，但 TUI 与 Codex 差异显著：
   - 所有内容整体向右缩进 2 列（col=0/1 恒为空格）
-  - 输入框由 ▄/▀ 半块字符 + fg=#808080 灰色画边，**非** pyte bg 属性
+  - 输入框由 ▄/▀ 半块字符 + fg=#808080 灰色画边（思考中时 ▄ fg 变为 #151515，
+    且可能只有上边框没有下边框）
   - 输入提示符为 → (U+2192)，**非** Codex 的 › (U+203A)
   - 输出内容无 ● / ✱ / › 等首列指示字符，纯文本渲染（灰色 fg）
+  - 思考/执行中：输出区尾部出现 "  {braille_spinner} {action} [token_count]" 行
+    braille_spinner = U+2800..U+28FF 的盲文点阵字符帧，fg 为绿色
   - 底部区只有 `Composer X Fast · usage` 与 `/cwd` 两行，无 `─━═` 分割线
 
-因此 AgentParser 完全 override parse()，使用 Cursor 专属的解析路径，不再复用
-CodexParser 的 ─/背景色/›提示符那一套。作为子类仅复用共享的工具函数（_get_col0、
-_get_row_text、_get_row_ansi_text 等）。
+因此 AgentParser 完全 override parse()，使用 Cursor 专属的解析路径：
+  - 输入区通过 → 行定位（▄/▀ 边框为可选装饰，思考中常常缺失下边框）
+  - 思考状态通过 braille + green fg 的 spinner 行识别，升级为 StatusLine，
+    这样 lark 卡片才能正确显示 "⏳ 思考中" 头部
 """
 
 import logging
+import re
 import time
 from typing import List, Optional, Set, Tuple
 
 import pyte
 
 from utils.components import (
-    Component, OutputBlock, BottomBar,
+    Component, OutputBlock, BottomBar, StatusLine,
 )
 
 from .codex_parser import (
     CodexParser,
-    _get_col0, _get_row_text, _get_row_ansi_text,
+    _get_row_text, _get_row_ansi_text,
     BOX_CORNER_TOP, BOX_CORNER_BOTTOM,
 )
 
 logger = logging.getLogger('AgentParser')
 
 
-# Cursor Agent 输入框上下边框字符（半块字符，fg=#808080 灰色）
+# Cursor Agent 输入框上下边框字符（半块字符）
 _TOP_BORDER_CHAR = '▄'
 _BOT_BORDER_CHAR = '▀'
 
 # Cursor Agent 输入提示符（→，U+2192）
-_CURSOR_PROMPT_CHARS: Set[str] = {'→'}
+_CURSOR_PROMPT: str = '→'
 
 # 判定一行是边框需要的最少连续边框字符数（防止普通文本中的 ▄/▀ 被误判）
 _BORDER_MIN_RUN = 10
@@ -45,11 +50,17 @@ _BORDER_MIN_RUN = 10
 _WELCOME_TITLE_TEXT = 'Cursor Agent'
 _WELCOME_VERSION_PREFIX = 'v20'  # 形如 v2026.04.17-787b533
 
-# 输入框上/下边框与输入内容之间的最大行距（通常 0~2 行）
-_MAX_INPUT_HEIGHT = 20
-
 # Cursor Agent 底部栏最大行数（Composer 行 + /cwd 行，一般不超过 3）
 _BOTTOM_SCAN_ROWS = 4
+
+# Braille 点阵字符范围（spinner 帧，每帧一个 U+2800..U+28FF 字符）
+_BRAILLE_START = 0x2800
+_BRAILLE_END = 0x28FF
+
+# StatusLine 文本解析正则（剥离行首 braille 与空格后匹配动词 + 可选 token 计数）
+_STATUS_BODY_RE = re.compile(
+    r'^(?P<action>\S+)(?:\s+(?P<tokens>.+?))?$'
+)
 
 
 def _count_max_run(text: str, ch: str) -> int:
@@ -74,6 +85,60 @@ def _is_border_row(screen: pyte.Screen, row: int, border_char: str) -> bool:
     return _count_max_run(text, border_char) >= _BORDER_MIN_RUN
 
 
+def _is_braille(ch: str) -> bool:
+    """判断字符是否为 braille 点阵（spinner 帧字符）"""
+    return len(ch) == 1 and _BRAILLE_START <= ord(ch) <= _BRAILLE_END
+
+
+def _is_greenish(fg) -> bool:
+    """判断 fg 颜色是否为绿色系（Cursor Agent spinner 特征色）"""
+    if not fg or fg == 'default':
+        return False
+    if isinstance(fg, str):
+        key = fg.lower().replace(' ', '').replace('-', '')
+        if 'green' in key:
+            return True
+        if len(fg) == 6:
+            try:
+                r = int(fg[0:2], 16)
+                g = int(fg[2:4], 16)
+                b = int(fg[4:6], 16)
+                # G 显著大于 R 和 B 即视为绿色
+                return g > 100 and g > r and g > b
+            except ValueError:
+                return False
+    return False
+
+
+def _is_spinner_row(screen: pyte.Screen, row: int) -> Optional[str]:
+    """某行是否为 Cursor Agent 思考中 spinner 行。
+
+    特征：前若干列（通常 col=1/2）有 braille 字符，且至少有一个 braille 字符 fg 是绿色。
+    返回 spinner indicator 字符（首个 braille），非 spinner 行返回 None。
+    """
+    indicator: Optional[str] = None
+    for col in range(0, min(6, screen.columns)):
+        try:
+            ch = screen.buffer[row][col]
+        except (KeyError, IndexError):
+            continue
+        if _is_braille(ch.data):
+            if indicator is None:
+                indicator = ch.data
+            if _is_greenish(getattr(ch, 'fg', 'default')):
+                return indicator
+    return None
+
+
+def _find_input_row(screen: pyte.Screen, scan_limit: int) -> Optional[int]:
+    """从 scan_limit 向上扫描，找到行首（strip 后）为 → 的行。"""
+    for row in range(scan_limit, -1, -1):
+        text = _get_row_text(screen, row).strip()
+        if text.startswith(_CURSOR_PROMPT):
+            return row
+    return None
+
+
 class AgentParser(CodexParser):
     """Cursor Agent CLI 专用解析器
 
@@ -86,17 +151,26 @@ class AgentParser(CodexParser):
 
         scan_limit = min(screen.cursor.y + 5, screen.lines - 1)
 
-        # Step 1：定位输入框（▄ 上边框 + ▀ 下边框）
-        top_border, bot_border = self._find_input_box(screen, scan_limit)
+        # Step 1：定位输入框（以 → 行为锚，▄/▀ 边框为可选装饰）
+        input_row = _find_input_row(screen, scan_limit)
 
-        if top_border is not None and bot_border is not None:
-            output_rows = list(range(top_border))
-            input_rows = list(range(top_border + 1, bot_border))
-            bottom_rows = list(range(bot_border + 1,
-                                     min(bot_border + 1 + _BOTTOM_SCAN_ROWS,
+        if input_row is not None:
+            top_border = (input_row - 1) if (
+                input_row > 0 and _is_border_row(screen, input_row - 1, _TOP_BORDER_CHAR)
+            ) else None
+            bot_border = (input_row + 1) if (
+                input_row < screen.lines - 1
+                and _is_border_row(screen, input_row + 1, _BOT_BORDER_CHAR)
+            ) else None
+            box_start = top_border if top_border is not None else input_row
+            box_end = bot_border if bot_border is not None else input_row
+            output_rows = list(range(box_start))
+            input_rows = [input_row]
+            bottom_rows = list(range(box_end + 1,
+                                     min(box_end + 1 + _BOTTOM_SCAN_ROWS,
                                          screen.lines)))
         else:
-            # 输入框尚未渲染（冷启动 / 仅有 Workspace Trust 对话框等场景）
+            # 输入框尚未渲染（冷启动 / Workspace Trust 对话框等场景）
             output_rows = list(range(scan_limit + 1))
             input_rows = []
             bottom_rows = []
@@ -106,14 +180,23 @@ class AgentParser(CodexParser):
         # Step 2：跳过欢迎区（Cursor Agent 标题 + 版本号 + Workspace Trust 对话框）
         output_rows = self._trim_cursor_welcome(screen, output_rows)
 
-        # Step 3：输出区按空行切分为 OutputBlock
+        # Step 3：识别 StatusLine（braille spinner + green fg 行），从 output_rows 中剔除
+        status_row, status_component = self._extract_status_line(screen, output_rows)
+        if status_row is not None:
+            output_rows = [r for r in output_rows if r != status_row]
+
+        # Step 4：输出区按空行切分为 OutputBlock
         components: List[Component] = self._parse_output_indented(screen, output_rows)
 
-        # Step 4：提取输入区 → 后的文本
+        # Step 5：StatusLine（如果检测到）附在 components 末尾，便于 OutputWatcher 分拣
+        if status_component is not None:
+            components.append(status_component)
+
+        # Step 6：提取输入区 → 后的文本
         self.last_input_text = self._extract_cursor_input_text(screen, input_rows)
         self.last_input_ansi_text = self.last_input_text
 
-        # Step 5：BottomBar（Composer X Fast · usage / /cwd 两行合并）
+        # Step 7：BottomBar（Composer X Fast · usage / /cwd 两行合并）
         bottom_parts: List[str] = []
         ansi_bottom_parts: List[str] = []
         for r in bottom_rows:
@@ -140,33 +223,7 @@ class AgentParser(CodexParser):
         )
         return components
 
-    # ── 区域定位 ──────────────────────────────────────────────────────────────
-
-    def _find_input_box(
-        self, screen: pyte.Screen, scan_limit: int
-    ) -> Tuple[Optional[int], Optional[int]]:
-        """从 scan_limit 向上找 ▀ 下边框，再向上找 ▄ 上边框。
-
-        限制：上下边框之间距离 ≤ _MAX_INPUT_HEIGHT 行；两个边框必须成对出现。
-        返回 (top_row, bot_row)，未找到返回 (None, None)。
-        """
-        bot: Optional[int] = None
-        for row in range(scan_limit, -1, -1):
-            if _is_border_row(screen, row, _BOT_BORDER_CHAR):
-                bot = row
-                break
-        if bot is None:
-            return (None, None)
-
-        top: Optional[int] = None
-        lower_bound = max(-1, bot - _MAX_INPUT_HEIGHT - 1)
-        for row in range(bot - 1, lower_bound, -1):
-            if _is_border_row(screen, row, _TOP_BORDER_CHAR):
-                top = row
-                break
-        if top is None:
-            return (None, None)
-        return (top, bot)
+    # ── 欢迎区裁剪 ────────────────────────────────────────────────────────────
 
     def _trim_cursor_welcome(
         self, screen: pyte.Screen, rows: List[int]
@@ -195,7 +252,6 @@ class AgentParser(CodexParser):
             # 丢弃 "Cursor Agent" 标题 + 版本号
             if text == _WELCOME_TITLE_TEXT:
                 keep[i] = False
-                # 尝试跳过紧跟的版本号行（允许中间零空行）
                 j = i + 1
                 while j < len(rows):
                     t2 = _get_row_text(screen, rows[j]).strip()
@@ -226,6 +282,53 @@ class AgentParser(CodexParser):
 
         return [rows[k] for k in range(len(rows)) if keep[k]]
 
+    # ── StatusLine 识别 ──────────────────────────────────────────────────────
+
+    def _extract_status_line(
+        self, screen: pyte.Screen, rows: List[int]
+    ) -> Tuple[Optional[int], Optional[StatusLine]]:
+        """在 output_rows 中查找 braille spinner 行作为 StatusLine。
+
+        扫描方向：从后向前（spinner 总是出现在输出区尾部，即紧挨 ▄ 上边框）。
+        返回 (spinner_row, StatusLine) 或 (None, None)。
+        """
+        for row in reversed(rows):
+            indicator = _is_spinner_row(screen, row)
+            if indicator is None:
+                continue
+
+            raw_text = _get_row_text(screen, row)
+            ansi_raw = _get_row_ansi_text(screen, row)
+
+            # 剥离前导 braille 帧字符和空白，得到 "action [tokens]"
+            body = raw_text.lstrip()
+            stripped_body_chars: List[str] = []
+            skipping = True
+            for ch in body:
+                if skipping and (_is_braille(ch) or ch.isspace()):
+                    continue
+                skipping = False
+                stripped_body_chars.append(ch)
+            body_text = ''.join(stripped_body_chars).rstrip()
+
+            action = ''
+            tokens = ''
+            m = _STATUS_BODY_RE.match(body_text)
+            if m:
+                action = m.group('action') or ''
+                tokens = (m.group('tokens') or '').strip()
+
+            return row, StatusLine(
+                action=action,
+                elapsed='',
+                tokens=tokens,
+                raw=raw_text.strip(),
+                ansi_raw=ansi_raw.strip(),
+                indicator=indicator,
+                ansi_indicator=indicator,
+            )
+        return None, None
+
     # ── 输出区解析 ────────────────────────────────────────────────────────────
 
     def _parse_output_indented(
@@ -249,7 +352,6 @@ class AgentParser(CodexParser):
             ansi_lines: List[str] = []
             for r in current:
                 raw = _get_row_text(screen, r)
-                # 去除最左 2 空格缩进（Cursor Agent 全局 indent）
                 if raw.startswith('  '):
                     raw = raw[2:]
                 lines.append(raw.rstrip())
@@ -285,7 +387,7 @@ class AgentParser(CodexParser):
         """输入区以 → 为提示符，返回 → 之后的当前文本"""
         for row in input_rows:
             text = _get_row_text(screen, row)
-            idx = text.find('→')
+            idx = text.find(_CURSOR_PROMPT)
             if idx >= 0:
                 return text[idx + 1:].strip()
         return ''

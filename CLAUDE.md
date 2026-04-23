@@ -634,14 +634,17 @@ Cursor Agent 虽然和 Codex 同为 Ink 框架，但 UI 设计差异很大，必
 | 输出指示字符 | `●` / `⏺` | `•` | **无**，纯文本渲染（fg=#808080 灰色） |
 | StatusLine | 星星字符 blink | 圆点字符 blink | 暂未识别（本版本不处理） |
 
-### Cursor Agent 区域切分策略（`_find_input_box`）
+### Cursor Agent 区域切分策略（以 `→` 行为锚）
 
-从 `cursor.y+5` 向上扫描：
-1. 找到第一个连续 ≥10 个 `▀` 字符的行 → 输入框下边框 `bot_border`
-2. 从 `bot_border - 1` 向上最多 20 行，找到连续 ≥10 个 `▄` 字符的行 → 输入框上边框 `top_border`
-3. 两个边框都找到 → 上方 = 输出区，两框之间 = input_rows，下方（最多 4 行）= bottom_rows
+从 `cursor.y+5` 向上扫描，找到首个 strip 后行首为 `→` 的行作为 **input_row**（锚点）。以 input_row 为基准：
+1. 上邻行若为 ≥10 连续 `▄` 行 → top_border（可选）
+2. 下邻行若为 ≥10 连续 `▀` 行 → bot_border（可选）
+3. `box_start` = top_border or input_row；`box_end` = bot_border or input_row
+4. 输出区 = `rows[0:box_start]`；input_rows = `[input_row]`；bottom_rows = `rows[box_end+1 : box_end+1+4]`
 
-若未找到成对边框（如首启动 Trust 对话框尚未关闭），则整个可见范围全部作为 output_rows 走 `_trim_cursor_welcome` 路径，最终产出 0 block（欢迎框被整块丢弃）。
+**为什么以 → 行为锚而非 ▄/▀**：Cursor Agent 在思考早期阶段常常只渲染上半边框（`▄`）而缺下边框（`▀`），此时若要求 ▄/▀ 配对会丢失整个输入区，进而把 spinner 行和底部栏都错划到 output_rows 里去。→ 提示符字符独特且总是出现，是最稳定的锚点。
+
+若未找到 `→`（如首启动 Trust 对话框尚未关闭），则整个可见范围全部作为 output_rows 走 `_trim_cursor_welcome` 路径，最终产出 0 block（欢迎框被整块丢弃）。
 
 ### Cursor Agent 欢迎区识别（`_trim_cursor_welcome`）
 
@@ -659,7 +662,25 @@ Cursor Agent 的输出无圆点/星号等首列指示字符，每条消息是纯
 - 每行文本剥离最左 2 空格缩进（`if raw.startswith('  '): raw = raw[2:]`）
 - `block_id` 走 `OutputBlock` 默认前缀 `O:{首行}`
 
-本版本不区分"用户输入回显"和"agent 回复"，两者都产出 `OutputBlock`（后续如需精细区分，可按 bg 属性或位置推断）。本版本也不解析 StatusLine、OptionBlock、AgentPanelBlock 等状态型组件（Cursor Agent 暂未观察到这些场景的稳定样本）。
+本版本不区分"用户输入回显"和"agent 回复"，两者都产出 `OutputBlock`（后续如需精细区分，可按 bg 属性或位置推断）。本版本也不解析 OptionBlock、AgentPanelBlock（Cursor Agent 暂未观察到这些场景的稳定样本）。
+
+### Cursor Agent 思考/执行中 StatusLine 识别（`_extract_status_line`）
+
+Cursor Agent 在思考/工具调用/读取文件时，会在输出区尾部（紧挨 `▄` 上边框前）渲染一行形如：
+
+```
+  ⠳⠀ Working
+  ⠰⠃ Running  53 tokens
+  ⠛⠄ Reading  24.16k tokens
+```
+
+**识别特征**：
+- 行首若干列（col=1~5）含至少一个 **braille 点阵字符**（U+2800–U+28FF），并且**至少一个 braille 字符 fg 为绿色系**（green / brightgreen / hex 颜色中 G 显著 > R、B）。
+- 剥离行首 braille 帧字符与空白后，第一个单词是 action（`Working`、`Running`、`Reading` 等），后续文字作为 `tokens`（如 `53 tokens`）。
+
+**处理**：匹配到的行从 output_rows 中剔除，升级为 `StatusLine(action, tokens, raw, indicator, ...)`。这样 lark 卡片 header 才会按 CLAUDE 规则显示 `⏳ {action}` 橙色，而不是退化到 `✅ Cursor 就绪`。
+
+注意不能只靠 "content 含 Working/Running" 等关键词（Cursor 输出里 shell 命令、模型名里可能出现），必须要有 braille + green 双重特征。
 
 ## 文件结构
 
