@@ -23,6 +23,7 @@ from typing import Dict, Optional
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
     CreateImageRequest, CreateImageRequestBody,
+    UpdateChatRequest, UpdateChatRequestBody,
 )
 
 from . import config
@@ -149,6 +150,28 @@ async def get_avatar_image_key(cli_type: str, force: bool = False) -> Optional[s
     cache[cli_type] = key
     _save_cache(cache)
     return key
+
+
+def _update_chat_avatar_sync(chat_id: str, avatar_key: str) -> tuple:
+    """同步更新群头像，返回 (ok: bool, err_msg: str)"""
+    client = _get_client()
+    if client is None:
+        return False, "lark client 未初始化"
+    try:
+        body = UpdateChatRequestBody.builder().avatar(avatar_key).build()
+        req = UpdateChatRequest.builder().chat_id(chat_id).request_body(body).build()
+        resp = client.im.v1.chat.update(req)
+    except Exception as e:
+        return False, str(e)
+    if not resp.success():
+        return False, f"code={resp.code} msg={resp.msg}"
+    return True, ""
+
+
+async def update_chat_avatar(chat_id: str, avatar_key: str) -> tuple:
+    """异步封装：PUT /im/v1/chats/{chat_id} 写 avatar，返回 (ok, err_msg)"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _update_chat_avatar_sync, chat_id, avatar_key)
 
 
 async def refresh_all() -> Dict[str, Optional[str]]:

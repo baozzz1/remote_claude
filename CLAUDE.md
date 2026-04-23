@@ -43,7 +43,9 @@ client.py  SessionBridge (lark_client/)
 - `session_bridge.py` — 连接 Unix Socket，**仅负责输入发送**（send_input/send_key）和连接管理
 - `shared_memory_poller.py` — **流式滚动卡片轮询器**：每秒轮询 `.mq` 共享内存，通过 hash diff 驱动 `CardSlice`/`StreamTracker` 就地更新或冻结+开新卡
 - `card_builder.py` — **`build_stream_card(blocks, status_line, bottom_bar, is_frozen, agent_panel, option_block, session_name, disconnected)`**：四层结构卡片构建（内容区/状态区/交互区/菜单）+ 辅助卡片（session_list/menu/help/dir 等）
-- `avatar_uploader.py` — 群头像管理：按 `cli_type`（claude/codex/agent）上传 `lark_client/assets/icons/*.png` 到飞书 `im/v1/images`（`image_type=avatar`），返回的 `image_key` 缓存到 `~/.remote-claude/lark_avatar_keys.json`。`_cmd_new_group` 会在建群 body 里带 `avatar=image_key`；`/refresh-avatar` 命令支持手动刷新单个群或批量刷新全部群（`/refresh-avatar all`）
+- `avatar_uploader.py` — 群头像管理：按 `cli_type`（claude/codex/agent）上传 `lark_client/assets/icons/*.png` 到飞书 `im/v1/images`（`image_type=avatar`），返回的 `image_key` 缓存到 `~/.remote-claude/lark_avatar_keys.json`；并封装 `update_chat_avatar()` 调 `PUT /im/v1/chats/{id}` 写 `avatar` 字段。入口：
+  - **lark daemon 内**：`_cmd_new_group` 建群时自动带 `avatar=image_key`；`/refresh-avatar` / `/refresh-avatar all` 命令运行时刷新
+  - **CLI**：`remote-claude lark refresh-avatar` 不依赖 daemon 运行，直接读 `~/.remote-claude/lark_chat_bindings.json` + `lark_group_ids.json` 批量更新；`--chat-id <id>` 仅更新单个群；`--upload-only` 只重传图标不刷群
 - `card_service.py` — 飞书卡片 API 服务（create/update/send）
 - `rich_text_renderer.py` — 持久化 pyte Screen 封装（server 端实时喂入）
 

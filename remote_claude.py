@@ -716,6 +716,90 @@ def cmd_lark_init(args):
     return rc
 
 
+def cmd_lark_refresh_avatar(args):
+    """重新上传 Claude/Codex/Cursor 品牌图标，并同步到所有已绑定的专属群"""
+    import asyncio
+    import json as _json
+
+    # 加载 ~/.remote-claude/.env
+    env_path = USER_DATA_DIR / ".env"
+    if env_path.exists():
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(env_path)
+        except Exception:
+            pass
+
+    # 必须在 .env 之后导入（config.py 读 env）
+    import sys as _sys
+    _sys.path.insert(0, str(SCRIPT_DIR))
+    from lark_client import avatar_uploader
+    from lark_client import config as _cfg
+    from utils.session import list_active_sessions
+
+    if not (_cfg.FEISHU_APP_ID and _cfg.FEISHU_APP_SECRET):
+        print("❌ 未配置 FEISHU_APP_ID / FEISHU_APP_SECRET（~/.remote-claude/.env）")
+        return 1
+
+    chat_only = getattr(args, "chat_id", None)
+    no_update = getattr(args, "upload_only", False)
+
+    async def _run():
+        # 1. 强制重新上传所有图标（force=True）
+        print("📤 正在上传图标到飞书...")
+        keys = await avatar_uploader.refresh_all()
+        for cli, k in keys.items():
+            status = "✓" if k else "✗"
+            print(f"  {status} {cli}: {k or '上传失败'}")
+        if no_update:
+            return 0
+
+        # 2. 读取 bindings 与 group list
+        bindings_path = USER_DATA_DIR / "lark_chat_bindings.json"
+        group_ids_path = USER_DATA_DIR / "lark_group_ids.json"
+        if not bindings_path.exists() or not group_ids_path.exists():
+            print("⚠️  尚未有任何专属群绑定，跳过群头像更新")
+            return 0
+        try:
+            bindings = _json.loads(bindings_path.read_text(encoding="utf-8"))
+            group_ids = set(_json.loads(group_ids_path.read_text(encoding="utf-8")))
+        except Exception as e:
+            print(f"❌ 读取绑定文件失败: {e}")
+            return 1
+
+        sessions = {s["name"]: s for s in list_active_sessions()}
+        targets = []
+        for cid, sess_name in bindings.items():
+            if cid not in group_ids:
+                continue
+            if chat_only and cid != chat_only:
+                continue
+            cli_type = (sessions.get(sess_name) or {}).get("cli_type", "claude")
+            targets.append((cid, sess_name, cli_type))
+
+        if not targets:
+            print("⚠️  没有匹配的专属群需要更新")
+            return 0
+
+        print(f"\n🔄 正在更新 {len(targets)} 个群的头像...")
+        ok_count = 0
+        for cid, sess_name, cli_type in targets:
+            key = keys.get(cli_type)
+            if not key:
+                print(f"  ✗ {cid[:12]}… ({sess_name}) — {cli_type} 图标未上传")
+                continue
+            ok, err = await avatar_uploader.update_chat_avatar(cid, key)
+            if ok:
+                ok_count += 1
+                print(f"  ✓ {cid[:12]}… ({sess_name}) → {cli_type}")
+            else:
+                print(f"  ✗ {cid[:12]}… ({sess_name}) — {err}")
+        print(f"\n✅ 完成：{ok_count}/{len(targets)} 个群头像已更新")
+        return 0
+
+    return asyncio.run(_run())
+
+
 def cmd_lark(args):
     """飞书客户端管理（兼容旧命令）"""
     # 如果没有子命令，默认显示状态或启动
@@ -859,6 +943,21 @@ def main():
     lark_init_group.add_argument("--check", action="store_true", help="仅检查当前配置状态")
     lark_init_group.add_argument("--new", action="store_true", help="扫码创建新应用（不修改已有配置）")
     lark_init_parser.set_defaults(func=cmd_lark_init)
+
+    # lark refresh-avatar
+    lark_refresh_parser = lark_subparsers.add_parser(
+        "refresh-avatar",
+        help="重新上传 Claude/Codex/Cursor 图标并同步到所有专属群（不需要 lark daemon 运行）"
+    )
+    lark_refresh_parser.add_argument(
+        "--chat-id", dest="chat_id", default=None,
+        help="仅更新指定 chat_id 的群（默认：所有已绑定的群）"
+    )
+    lark_refresh_parser.add_argument(
+        "--upload-only", action="store_true", dest="upload_only",
+        help="仅重新上传图标、不刷任何群"
+    )
+    lark_refresh_parser.set_defaults(func=cmd_lark_refresh_avatar)
 
     # 如果只输入 lark 没有子命令，使用默认处理
     lark_parser.set_defaults(func=cmd_lark)
