@@ -34,7 +34,7 @@ from .group_naming import build_group_chat_name
 from .shared_memory_poller import SharedMemoryPoller, CardSlice
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils.session import list_active_sessions, get_socket_path, get_chat_bindings_file, ensure_user_data_dir, USER_DATA_DIR
+from utils.session import list_active_sessions, get_socket_path, get_chat_bindings_file, ensure_user_data_dir, USER_DATA_DIR, tildify, is_session_active
 
 
 def _read_log_since(since: '_datetime', log_path: 'Path') -> str:
@@ -212,6 +212,33 @@ class LarkHandler:
         if active_slice:
             await self._update_card_disconnected(chat_id, session_name, active_slice)
 
+        # session 若已彻底结束（kill / PTY 自然退出 / server 崩溃），解散绑定的专属群。
+        # 延迟一点再判断，避免与 server._shutdown() 里 cleanup_session 的竞态：
+        # clients 先被 close，cleanup_session 在后面才执行，存在短暂 pid/sock 仍存在的窗口。
+        asyncio.create_task(self._disband_if_session_gone(session_name))
+
+    async def _disband_if_session_gone(self, session_name: str,
+                                        grace_seconds: float = 3.0) -> None:
+        """断线后等待 grace_seconds，确认 session 已彻底结束才解散绑定的专属群。
+
+        判定依据：`is_session_active` 综合检查 socket、pid 文件及进程存活。
+        server._shutdown 最后才 `cleanup_session`，因此一段宽限期后仍未活跃即判定为
+        session 真的结束（而非网络抖动或 lark daemon 重启）。
+        """
+        await asyncio.sleep(grace_seconds)
+        if is_session_active(session_name):
+            logger.debug(f"会话 '{session_name}' 仍活跃，跳过自动解散群")
+            return
+
+        # 仅当确实有绑定群时才走解散路径，避免无意义的日志
+        bound_groups = [cid for cid in self._group_chat_ids
+                        if self._chat_bindings.get(cid) == session_name]
+        if not bound_groups:
+            return
+
+        logger.info(f"会话 '{session_name}' 已结束，自动解散 {len(bound_groups)} 个专属群")
+        await self._disband_groups_for_session(session_name, source="session-end")
+
     # ── 消息入口 ────────────────────────────────────────────────────────────
 
     async def handle_message(self, user_id: str, chat_id: str, text: str,
@@ -377,7 +404,7 @@ class LarkHandler:
         if self._poller.get_bypass_enabled():
             cmd += ["--", *_bypass_flags_for(cli_type)]
 
-        logger.info(f"启动会话: {session_name}, 工作目录: {work_dir}, cli_type: {cli_type}, 命令: {' '.join(cmd)}")
+        logger.info(f"启动会话: {session_name}, 工作目录: {tildify(work_dir)}, cli_type: {cli_type}, 命令: {' '.join(cmd)}")
         _track_stats('lark', 'cmd_start', session_name=session_name, chat_id=chat_id)
 
         try:
@@ -769,7 +796,7 @@ class LarkHandler:
 
         target = target.resolve()
         if not target.exists():
-            await card_service.send_text(chat_id, f"路径不存在：{target}")
+            await card_service.send_text(chat_id, f"路径不存在：{tildify(target)}")
             return
 
         try:

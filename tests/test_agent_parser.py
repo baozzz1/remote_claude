@@ -220,8 +220,19 @@ class TestThinkingStatusLine(unittest.TestCase):
                          f"expected 1 StatusLine, got components={[type(c).__name__ for c in comps]}")
         sl = status_lines[0]
         self.assertEqual(sl.action, 'Working')
-        self.assertTrue(sl.indicator and 0x2800 <= ord(sl.indicator) <= 0x28FF,
-                        f"indicator should be braille, got {sl.indicator!r}")
+        # 动画帧字符不得出现在 raw/ansi_raw/indicator 中（会导致下游 hash 抖动、卡片被无谓频繁更新）
+        self.assertEqual(sl.indicator, '', f"indicator should be stripped, got {sl.indicator!r}")
+        self.assertEqual(sl.ansi_indicator, '')
+        for ch in sl.raw:
+            self.assertFalse(
+                0x2800 <= ord(ch) <= 0x28FF,
+                f"raw should not contain braille spinner chars, got {sl.raw!r}",
+            )
+        for ch in sl.ansi_raw:
+            self.assertFalse(
+                0x2800 <= ord(ch) <= 0x28FF,
+                f"ansi_raw should not contain braille spinner chars, got {sl.ansi_raw!r}",
+            )
 
         # spinner 行被剔除，不应作为 OutputBlock 出现
         for b in output_blocks:
@@ -280,6 +291,43 @@ class TestThinkingStatusLine(unittest.TestCase):
         status_lines = [c for c in comps if isinstance(c, StatusLine)]
         self.assertEqual(len(status_lines), 0,
                          "no spinner → no StatusLine")
+
+
+class TestIndentStrippedInBothPlainAndAnsi(unittest.TestCase):
+    """Cursor Agent 所有内容向右 2 列；plain `content` 和 `ansi_content` 都必须剥离。
+
+    回归 P3：飞书卡片 renderer 用 `ansi_content`，若仅剥离 plain 版本，实际卡片
+    里 transcript 会整体右移 2 列。
+    """
+
+    def test_ansi_content_not_indented(self):
+        screen = _new_screen()
+        # 带 ANSI 着色的输出行（灰色 fg）
+        _write(screen, 2, 2, 'Hi there!', fg='808080')
+        _write(screen, 5, 1, '▄' * 200, fg='808080')
+        _write(screen, 6, 2, '→')
+        _write(screen, 7, 1, '▀' * 200, fg='808080')
+        _set_cursor(screen, 0, 8)
+
+        parser = AgentParser()
+        comps = parser.parse(screen)
+        output_blocks = [c for c in comps if isinstance(c, OutputBlock)]
+
+        self.assertEqual(len(output_blocks), 1)
+        block = output_blocks[0]
+
+        self.assertFalse(
+            block.content.startswith('  '),
+            f"plain content still indented: {block.content!r}"
+        )
+
+        # ANSI 内容里可见字符（去掉 ESC[…m 序列后）也不应以 2 空格开头
+        import re as _re
+        visible = _re.sub(r'\x1b\[[\d;]*m', '', block.ansi_content)
+        self.assertFalse(
+            visible.startswith('  '),
+            f"ansi_content visible text still indented: {visible!r}"
+        )
 
 
 class TestNonGreenBrailleIgnored(unittest.TestCase):

@@ -38,7 +38,7 @@ from utils.protocol import (
 from utils.session import (
     get_socket_path, get_pid_file, get_name_file, ensure_socket_dir,
     generate_client_id, cleanup_session, _safe_filename, _log_filename, get_env_file,
-    SOCKET_DIR
+    SOCKET_DIR, tildify,
 )
 
 logger = logging.getLogger('Server')
@@ -1001,7 +1001,7 @@ class ProxyServer:
         # 不适用于：C 扩展模块直接写文件描述符 2、解释器崩溃等底层错误
         error_log_path = os.path.expanduser('~/.remote-claude/server.error.log')
         sys.stderr = open(error_log_path, 'w', encoding='utf-8')
-        logger.info(f"已重定向 stderr 到 {error_log_path}")
+        logger.info(f"已重定向 stderr 到 {tildify(error_log_path)}")
 
         # 添加运行阶段日志文件
         log_name = _log_filename(self.session_name)

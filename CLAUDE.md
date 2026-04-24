@@ -39,7 +39,7 @@ client.py  SessionBridge (lark_client/)
 
 **飞书客户端 (`lark_client/`)：**
 - `main.py` — WebSocket 入口，事件分发
-- `lark_handler.py` — 命令路由，以 `chat_id` 为 key 统一管理群聊/私聊的 bridge 和绑定
+- `lark_handler.py` — 命令路由，以 `chat_id` 为 key 统一管理群聊/私聊的 bridge 和绑定。`_on_disconnect` 断连后会调度 `_disband_if_session_gone`（宽限期 3s），通过 `is_session_active` 二次确认；只有在 session 真的结束（`remote-claude kill` / PTY 内 `/exit` 自然退出 / server 崩溃）时才走 `_disband_groups_for_session` 自动解散绑定的专属群
 - `session_bridge.py` — 连接 Unix Socket，**仅负责输入发送**（send_input/send_key）和连接管理
 - `shared_memory_poller.py` — **流式滚动卡片轮询器**：每秒轮询 `.mq` 共享内存，通过 hash diff 驱动 `CardSlice`/`StreamTracker` 就地更新或冻结+开新卡
 - `card_builder.py` — **`build_stream_card(blocks, status_line, bottom_bar, is_frozen, agent_panel, option_block, session_name, disconnected)`**：四层结构卡片构建（内容区/状态区/交互区/菜单）+ 辅助卡片（session_list/menu/help/dir 等）
@@ -733,6 +733,7 @@ remote_claude/
 │   ├── test_agent_parser.py    # Cursor Agent 解析器单元测试（▄/▀ 边框、2 空格 indent、→ prompt）
 │   ├── test_avatar_uploader.py # 群头像上传器单元测试（图标映射、缓存命中、force 刷新）
 │   ├── test_notify_mode.py     # 完成通知模式与冷却回归测试
+│   ├── test_session_end_disband.py # 会话结束自动解散专属群回归测试
 │   ├── test_integration.py     # 集成测试
 │   ├── test_attach_dedup.py
 │   ├── test_message_queue.py
@@ -813,6 +814,7 @@ uv run python3 tests/test_dedup_blocks.py                 # Ink 重绘副本合�
 uv run python3 tests/test_agent_parser.py                 # Cursor Agent 解析器测试（▄/▀ 边框、indent、→ prompt）
 uv run python3 tests/test_avatar_uploader.py              # 群头像上传器测试（图标映射、缓存命中、force 刷新）
 uv run python3 tests/test_notify_mode.py                  # 通知模式与跨任务冷却测试
+uv run python3 tests/test_session_end_disband.py          # 会话结束自动解散专属群测试
 uv run python3 tests/test_renderer.py                     # 终端渲染器测试
 uv run python3 tests/test_output_clean.py                 # 输出清理器测试
 uv run python3 lark_client/output_cleaner.py              # output_cleaner 自带测试

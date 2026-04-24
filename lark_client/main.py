@@ -17,7 +17,7 @@ from pathlib import Path
 
 # 设置 sys.path 以导入 utils 模块
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from utils.session import USER_DATA_DIR
+from utils.session import USER_DATA_DIR, tildify
 
 
 def _setup_logging():
@@ -250,7 +250,7 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
         # 目录卡片：进入子目录（继续浏览，就地更新原卡片）
         if action_type == "dir_browse":
             path = action_value.get("path", "")
-            print(f"[Lark] dir_browse: path={path}")
+            print(f"[Lark] dir_browse: path={tildify(path)}")
             asyncio.create_task(handler._cmd_ls(user_id, chat_id, path, message_id=message_id))
             return None
 
@@ -265,7 +265,7 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
         if action_type == "dir_page":
             path = action_value.get("path", "")
             page = int(action_value.get("page", 0))
-            print(f"[Lark] dir_page: path={path}, page={page}")
+            print(f"[Lark] dir_page: path={tildify(path)}, page={page}")
             asyncio.create_task(handler._cmd_ls(user_id, chat_id, path, message_id=message_id, page=page))
             return None
 
@@ -274,7 +274,7 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
             path = action_value.get("path", "")
             session_name = action_value.get("session_name", "")
             cli_type = action_value.get("cli_type", "claude")
-            print(f"[Lark] dir_start: path={path}, session={session_name}, cli_type={cli_type}")
+            print(f"[Lark] dir_start: path={tildify(path)}, session={session_name}, cli_type={cli_type}")
             asyncio.create_task(handler._cmd_start(user_id, chat_id, f"{session_name} {path}", cli_type=cli_type))
             return None
 
@@ -283,7 +283,7 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
             path = action_value.get("path", "")
             session_name = action_value.get("session_name", "")
             cli_type = action_value.get("cli_type", "claude")
-            print(f"[Lark] dir_new_group: path={path}, session={session_name}, cli_type={cli_type}")
+            print(f"[Lark] dir_new_group: path={tildify(path)}, session={session_name}, cli_type={cli_type}")
             asyncio.create_task(handler._cmd_start_and_new_group(user_id, chat_id, session_name, path, cli_type=cli_type))
             return None
 

@@ -22,7 +22,7 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from utils.session import USER_DATA_DIR, get_env_file
+from utils.session import USER_DATA_DIR, get_env_file, tildify
 
 # ── ANSI 颜色 ──────────────────────────────────────────────────────────────
 GREEN  = "\033[32m"
@@ -783,11 +783,11 @@ def run_check():
 
     # 检查 .env 文件
     if not env_path.exists():
-        _err(f"配置文件不存在：{env_path}")
+        _err(f"配置文件不存在：{tildify(env_path)}")
         print(f"\n运行 {CYAN}remote-claude lark init{RESET} 开始配置")
         return 1
 
-    _ok(f"配置文件：{env_path}")
+    _ok(f"配置文件：{tildify(env_path)}")
 
     app_id, app_secret = _read_current_config()
 
@@ -982,7 +982,7 @@ class SetupWizard:
 """)
         else:
             saved_path = write_env_file(app_id, app_secret)
-            _ok(f"已写入：{saved_path}")
+            _ok(f"已写入：{tildify(saved_path)}")
 
         print()
         _ok("配置全部完成！")

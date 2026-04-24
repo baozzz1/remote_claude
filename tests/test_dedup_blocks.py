@@ -11,12 +11,13 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
-sys.path.insert(0, str(_ROOT / "server"))
 
 from utils.components import (
     OutputBlock, UserInput, PlanBlock, SystemBlock,
 )
-from server import _dedup_blocks, _dedup_full_content
+# 用全限定路径导入，避免在 `python -m unittest discover` 下被已缓存的
+# `server` 包（server/__init__.py）拦截；这里需要的是模块 server/server.py
+from server.server import _dedup_blocks, _dedup_full_content
 
 
 def _ob(content, **kw):

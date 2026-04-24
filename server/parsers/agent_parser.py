@@ -298,18 +298,24 @@ class AgentParser(CodexParser):
                 continue
 
             raw_text = _get_row_text(screen, row)
-            ansi_raw = _get_row_ansi_text(screen, row)
 
-            # 剥离前导 braille 帧字符和空白，得到 "action [tokens]"
-            body = raw_text.lstrip()
-            stripped_body_chars: List[str] = []
-            skipping = True
-            for ch in body:
-                if skipping and (_is_braille(ch) or ch.isspace()):
-                    continue
-                skipping = False
-                stripped_body_chars.append(ch)
-            body_text = ''.join(stripped_body_chars).rstrip()
+            # 计算 body 起始列：前导空白 + 连续 braille/空白
+            skipped_left = 0
+            for ch in raw_text:
+                if ch == ' ' or ch == '':
+                    skipped_left += 1
+                else:
+                    break
+            for ch in raw_text[skipped_left:]:
+                if _is_braille(ch) or ch.isspace():
+                    skipped_left += 1
+                else:
+                    break
+
+            body_text = raw_text[skipped_left:].rstrip()
+            # 从 body 起始列取 ANSI 文本，避免把会变化的 braille 帧字符留在 ansi_raw 里
+            # （否则 spinner 每帧不同会令 status_line hash 持续变化、卡片被无谓频繁更新）
+            ansi_body = _get_row_ansi_text(screen, row, start_col=skipped_left).rstrip()
 
             action = ''
             tokens = ''
@@ -318,14 +324,16 @@ class AgentParser(CodexParser):
                 action = m.group('action') or ''
                 tokens = (m.group('tokens') or '').strip()
 
+            # indicator 固定置空：card header 仅使用 action/elapsed/tokens；
+            # 保留动画帧字符只会让下游 hash 抖动。
             return row, StatusLine(
                 action=action,
                 elapsed='',
                 tokens=tokens,
-                raw=raw_text.strip(),
-                ansi_raw=ansi_raw.strip(),
-                indicator=indicator,
-                ansi_indicator=indicator,
+                raw=body_text,
+                ansi_raw=ansi_body,
+                indicator='',
+                ansi_indicator='',
             )
         return None, None
 
@@ -352,10 +360,15 @@ class AgentParser(CodexParser):
             ansi_lines: List[str] = []
             for r in current:
                 raw = _get_row_text(screen, r)
-                if raw.startswith('  '):
-                    raw = raw[2:]
+                # 决定该行的 2 列 indent 是否要剥离（Cursor Agent 全局向右 2 空格）
+                strip_cols = 2 if raw.startswith('  ') else 0
+                if strip_cols:
+                    raw = raw[strip_cols:]
                 lines.append(raw.rstrip())
-                ansi_lines.append(_get_row_ansi_text(screen, r).rstrip())
+                # ANSI 版本也必须按同样的列数裁剪，否则飞书卡片里 transcript 会整体右移 2 列
+                ansi_lines.append(
+                    _get_row_ansi_text(screen, r, start_col=strip_cols).rstrip()
+                )
             content = '\n'.join(lines).strip('\n')
             ansi_content = '\n'.join(ansi_lines)
             if content:

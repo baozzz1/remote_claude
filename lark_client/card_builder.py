@@ -1071,7 +1071,8 @@ def build_dir_card(target, entries: List[Dict], sessions: List[Dict], tree: bool
     sessions 格式: [{"name": str, "cwd": str}]（仅用于信息展示，不影响按钮可用性）
     """
     import os
-    title = f"🌲 {target}" if tree else f"📂 {target}"
+    target_display = _shorten_path(str(target), max_len=60) or str(target)
+    title = f"🌲 {target_display}" if tree else f"📂 {target_display}"
     elements = []
 
     target_str = str(target).rstrip("/") or "/"
