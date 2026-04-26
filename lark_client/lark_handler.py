@@ -30,10 +30,11 @@ from .card_builder import (
     build_dir_card,
     build_menu_card,
 )
+from .group_naming import build_group_chat_name
 from .shared_memory_poller import SharedMemoryPoller, CardSlice
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils.session import list_active_sessions, get_socket_path, get_chat_bindings_file, ensure_user_data_dir, USER_DATA_DIR
+from utils.session import list_active_sessions, get_socket_path, get_chat_bindings_file, ensure_user_data_dir, USER_DATA_DIR, tildify, is_session_active
 
 
 def _read_log_since(since: '_datetime', log_path: 'Path') -> str:
@@ -55,6 +56,19 @@ try:
     from stats import track as _track_stats
 except Exception:
     def _track_stats(*args, **kwargs): pass
+
+
+# CLI 类型对应的免权限确认 flag（对应菜单上的 "新会话 bypass" 开关）
+_CLI_BYPASS_FLAGS: Dict[str, List[str]] = {
+    "claude": ["--dangerously-skip-permissions", "--permission-mode=dontAsk"],
+    "codex": ["--dangerously-bypass-approvals-and-sandbox"],
+    # Cursor Agent: --yolo = --force，配合 --approve-mcps 免 MCP 确认
+    "agent": ["--yolo", "--approve-mcps"],
+}
+
+
+def _bypass_flags_for(cli_type: str) -> List[str]:
+    return _CLI_BYPASS_FLAGS.get(cli_type, _CLI_BYPASS_FLAGS["claude"])
 
 
 class LarkHandler:
@@ -198,6 +212,51 @@ class LarkHandler:
         if active_slice:
             await self._update_card_disconnected(chat_id, session_name, active_slice)
 
+        # 等一段宽限期再判定：
+        # - session 已彻底结束（kill / PTY 自然退出 / server 崩溃）→ 解散绑定的专属群
+        # - session 仍活跃（read loop 异常 / socket 瞬时抖动）→ 自动 re-attach，
+        #   避免群里卡片永远停在"已断开"，必须用户操作才能恢复
+        asyncio.create_task(
+            self._disband_or_reattach_after_disconnect(chat_id, session_name)
+        )
+
+    async def _disband_or_reattach_after_disconnect(
+        self, chat_id: str, session_name: str, grace_seconds: float = 3.0
+    ) -> None:
+        """断线宽限期后分流：
+
+        - session 真的结束 → 解散绑定到该 session 的所有专属群（含本 chat_id）
+        - session 仍活跃 → 视作瞬时抖动，自动 re-attach 让卡片继续更新
+
+        宽限期用于：
+        1. 避开 `server._shutdown()` 的清理顺序（先 close client、最后才 cleanup_session）
+        2. 让用户后续 `/attach` 等显式操作覆盖本协程的自动决策
+        """
+        await asyncio.sleep(grace_seconds)
+
+        if not is_session_active(session_name):
+            bound_groups = [cid for cid in self._group_chat_ids
+                            if self._chat_bindings.get(cid) == session_name]
+            if not bound_groups:
+                return
+            logger.info(f"会话 '{session_name}' 已结束，自动解散 {len(bound_groups)} 个专属群")
+            await self._disband_groups_for_session(session_name, source="session-end")
+            return
+
+        # session 仍活跃：仅当 chat_id 仍绑定到同一 session 且无新 bridge 时才 re-attach，
+        # 避免覆盖用户期间手动 /attach 切到别的 session 的状态。
+        if self._chat_bindings.get(chat_id) != session_name:
+            return
+        if self._bridges.get(chat_id) is not None:
+            return
+        logger.info(f"会话 '{session_name}' 仍活跃但连接断开，自动 re-attach: chat_id={chat_id[:8]}...")
+        try:
+            ok = await self._attach(chat_id, session_name)
+            if not ok:
+                logger.warning(f"自动 re-attach 失败: chat_id={chat_id[:8]}..., session={session_name}")
+        except Exception as e:
+            logger.error(f"自动 re-attach 异常: {e}")
+
     # ── 消息入口 ────────────────────────────────────────────────────────────
 
     async def handle_message(self, user_id: str, chat_id: str, text: str,
@@ -251,6 +310,8 @@ class LarkHandler:
             await self._cmd_ls(user_id, chat_id, args, tree=(command == "/tree"))
         elif command == "/new-group":
             await self._cmd_new_group(user_id, chat_id, args)
+        elif command in ("/refresh-avatar", "/refresh-icon"):
+            await self._cmd_refresh_avatar(user_id, chat_id, args)
         elif command == "/help":
             await self._cmd_help(user_id, chat_id)
         elif command == "/menu":
@@ -356,15 +417,12 @@ class LarkHandler:
         script_dir = Path(__file__).parent.parent.absolute()
         server_script = script_dir / "server" / "server.py"
         cmd = ["uv", "run", "--project", str(script_dir), "python3", str(server_script), session_name]
-        if cli_type == "codex":
-            cmd += ["--cli-type", "codex"]
+        if cli_type != "claude":
+            cmd += ["--cli-type", cli_type]
         if self._poller.get_bypass_enabled():
-            if cli_type == "codex":
-                cmd += ["--", "--dangerously-bypass-approvals-and-sandbox"]
-            else:
-                cmd += ["--", "--dangerously-skip-permissions", "--permission-mode=dontAsk"]
+            cmd += ["--", *_bypass_flags_for(cli_type)]
 
-        logger.info(f"启动会话: {session_name}, 工作目录: {work_dir}, cli_type: {cli_type}, 命令: {' '.join(cmd)}")
+        logger.info(f"启动会话: {session_name}, 工作目录: {tildify(work_dir)}, cli_type: {cli_type}, 命令: {' '.join(cmd)}")
         _track_stats('lark', 'cmd_start', session_name=session_name, chat_id=chat_id)
 
         try:
@@ -439,13 +497,10 @@ class LarkHandler:
         script_dir = Path(__file__).parent.parent.absolute()
         server_script = script_dir / "server" / "server.py"
         cmd = ["uv", "run", "--project", str(script_dir), "python3", str(server_script), session_name]
-        if cli_type == "codex":
-            cmd += ["--cli-type", "codex"]
+        if cli_type != "claude":
+            cmd += ["--cli-type", cli_type]
         if self._poller.get_bypass_enabled():
-            if cli_type == "codex":
-                cmd += ["--", "--dangerously-bypass-approvals-and-sandbox"]
-            else:
-                cmd += ["--", "--dangerously-skip-permissions", "--permission-mode=dontAsk"]
+            cmd += ["--", *_bypass_flags_for(cli_type)]
 
         try:
             env = _os.environ.copy()
@@ -486,6 +541,52 @@ class LarkHandler:
             await card_service.send_text(chat_id, f"操作失败：{e}")
         finally:
             self._starting_sessions.discard(session_name)
+
+    async def _cmd_kill_confirm(self, user_id: str, chat_id: str, session_name: str):
+        """关闭会话前的确认步骤（对应 overflow 菜单的「关闭会话」）
+
+        飞书卡片的 overflow 组件不支持原生 confirm 弹窗，所以这里走服务端路径：
+        先推一张小卡片列出被关闭的会话名，配两个按钮：确认关闭 / 取消。
+        用户点「确认关闭」后才真正分发 list_kill。
+        """
+        if not session_name:
+            return
+        card = {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "⚠️ 确认关闭会话"},
+                "template": "red",
+            },
+            "body": {"elements": [
+                {"tag": "markdown",
+                 "content": f"即将关闭「**{session_name}**」。\n\n<font color='grey'>此操作不可撤销，会话内运行的进程将被终止；若存在绑定群聊，会被自动解散。</font>"},
+                {"tag": "column_set",
+                 "flex_mode": "flow",
+                 "horizontal_spacing": "small",
+                 "columns": [
+                     {"tag": "column", "width": "auto", "elements": [{
+                         "tag": "button",
+                         "text": {"tag": "plain_text", "content": "确认关闭"},
+                         "type": "danger",
+                         "width": "default",
+                         "behaviors": [{"type": "callback", "value": {
+                             "action": "list_kill", "session": session_name,
+                         }}],
+                     }]},
+                     {"tag": "column", "width": "auto", "elements": [{
+                         "tag": "button",
+                         "text": {"tag": "plain_text", "content": "取消"},
+                         "type": "default",
+                         "width": "default",
+                         "behaviors": [{"type": "callback", "value": {"action": "menu_open"}}],
+                     }]},
+                 ]},
+            ]},
+        }
+        card_id = await card_service.create_card(card)
+        if card_id:
+            await card_service.send_card(chat_id, card_id)
 
     async def _cmd_kill(self, user_id: str, chat_id: str, args: str,
                         message_id: Optional[str] = None):
@@ -660,16 +761,15 @@ class LarkHandler:
             if cid in self._chat_bindings
         }
         card = build_menu_card(sessions, current_session=current, session_groups=session_groups, page=page,
-                               notify_enabled=self._poller.get_notify_enabled(),
+                               notify_mode=self._poller.get_notify_mode(),
                                urgent_enabled=self._poller.get_urgent_enabled(),
                                bypass_enabled=self._poller.get_bypass_enabled())
         await self._send_or_update_card(chat_id, card, message_id)
 
-    async def _cmd_toggle_notify(self, user_id: str, chat_id: str,
-                                  message_id: Optional[str] = None):
-        """切换就绪通知开关并刷新菜单卡片"""
-        new_value = not self._poller.get_notify_enabled()
-        self._poller.set_notify_enabled(new_value)
+    async def _cmd_cycle_notify_mode(self, user_id: str, chat_id: str,
+                                      message_id: Optional[str] = None):
+        """循环切换完成通知频率模式并刷新菜单卡片"""
+        self._poller.cycle_notify_mode()
         await self._cmd_menu(user_id, chat_id, message_id=message_id)
 
     async def _cmd_toggle_urgent(self, user_id: str, chat_id: str,
@@ -714,7 +814,7 @@ class LarkHandler:
 
         target = target.resolve()
         if not target.exists():
-            await card_service.send_text(chat_id, f"路径不存在：{target}")
+            await card_service.send_text(chat_id, f"路径不存在：{tildify(target)}")
             return
 
         try:
@@ -750,21 +850,35 @@ class LarkHandler:
         session = next((s for s in sessions if s["name"] == session_name), None)
         pid = session.get("pid") if session else None
         cwd = self._get_pid_cwd(pid) if pid else None
-        from .card_builder import _get_display_name
-        dir_label = _get_display_name(session_name, cwd)
+        cli_type = (session or {}).get("cli_type", "claude")
+        resume_target = (session or {}).get("resume_target", "")
+        start_time = (session or {}).get("start_time", "")
 
         from . import config
         try:
             import json as _json
             import urllib.request
-            import datetime
-            _time_str = datetime.datetime.now().strftime("%H-%M")
-            group_name = f"{config.GROUP_NAME_PREFIX}{dir_label}-{_time_str}"
+            group_name = build_group_chat_name(
+                cli_type=cli_type,
+                cwd=cwd,
+                session_name=session_name,
+                resume_target=resume_target,
+                start_time=start_time,
+            )
             req_body = {
                 "name": group_name,
                 "description": f"Remote Claude 专属群 - 会话 {session_name}",
                 "user_id_list": [user_id],
             }
+            # 附加 cli_type 对应的品牌头像（失败不影响建群）
+            try:
+                from . import avatar_uploader
+                avatar_key = await avatar_uploader.get_avatar_image_key(cli_type)
+                if avatar_key:
+                    req_body["avatar"] = avatar_key
+            except Exception as _e:
+                logger.warning(f"获取 {cli_type} 头像 image_key 失败，跳过: {_e}")
+
             token_resp = urllib.request.urlopen(
                 urllib.request.Request(
                     "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
@@ -803,6 +917,128 @@ class LarkHandler:
         except Exception as e:
             logger.error(f"创建群失败: {e}")
             await card_service.send_text(chat_id, f"创建群失败：{e}")
+
+    async def _update_chat_avatar_via_api(
+        self, group_chat_id: str, avatar_key: str
+    ) -> tuple:
+        """PUT /open-apis/im/v1/chats/{chat_id} 更新群头像，返回 (ok, err_msg)"""
+        import json as _json
+        import urllib.request
+        import urllib.error
+        from . import config
+        try:
+            token_resp = urllib.request.urlopen(
+                urllib.request.Request(
+                    "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                    data=_json.dumps({
+                        "app_id": config.FEISHU_APP_ID,
+                        "app_secret": config.FEISHU_APP_SECRET,
+                    }).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                ), timeout=10,
+            )
+            token = _json.loads(token_resp.read())["tenant_access_token"]
+            try:
+                upd_resp = urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"https://open.feishu.cn/open-apis/im/v1/chats/{group_chat_id}",
+                        data=_json.dumps({"avatar": avatar_key}).encode(),
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {token}",
+                        },
+                        method="PUT",
+                    ), timeout=10,
+                )
+                upd_data = _json.loads(upd_resp.read())
+                if upd_data.get("code") == 0:
+                    return True, ""
+                return False, upd_data.get("msg", "")
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode("utf-8", errors="replace")
+                try:
+                    err_data = _json.loads(err_body)
+                    return False, f"code={err_data.get('code')} {err_data.get('msg', '')}"
+                except Exception:
+                    return False, f"HTTP {e.code}"
+        except Exception as e:
+            return False, str(e)
+
+    async def _cmd_refresh_avatar(self, user_id: str, chat_id: str, args: str,
+                                   message_id: Optional[str] = None):
+        """刷新群头像。
+
+        用法：
+          /refresh-avatar            — 刷新当前群（按绑定会话 cli_type 重新上传并更新）
+          /refresh-avatar all        — 强制重新上传全部 CLI 图标并更新所有专属群
+        """
+        from . import avatar_uploader
+        mode = (args or '').strip().lower()
+
+        if mode == 'all':
+            # 重新上传所有 cli_type 图标（force=True），再挨个更新绑定群
+            keys = await avatar_uploader.refresh_all()
+            updated = 0
+            failed = []
+            for cid in list(self._group_chat_ids):
+                sess_name = self._chat_bindings.get(cid)
+                sess = next((s for s in list_active_sessions()
+                             if s["name"] == sess_name), None) if sess_name else None
+                if sess:
+                    cli_type = sess.get('cli_type', 'claude')
+                else:
+                    # 会话已结束，按群名 `[cli]` 前缀推断
+                    cli_type = await avatar_uploader.infer_cli_type_from_chat(cid) or 'claude'
+                key = keys.get(cli_type)
+                if not key:
+                    failed.append(f"{cid[:8]}… ({cli_type} 未上传)")
+                    continue
+                ok, err = await self._update_chat_avatar_via_api(cid, key)
+                if ok:
+                    updated += 1
+                else:
+                    failed.append(f"{cid[:8]}… ({err})")
+            msg_lines = [
+                f"✅ 已为 {updated} 个群更新头像"
+            ]
+            if failed:
+                msg_lines.append("失败 " + str(len(failed)) + " 个：")
+                msg_lines.extend("  · " + s for s in failed[:10])
+            await card_service.send_text(chat_id, "\n".join(msg_lines))
+            return
+
+        # 默认模式：刷新当前群
+        if chat_id not in self._group_chat_ids:
+            await card_service.send_text(
+                chat_id,
+                "此命令仅在专属群内使用。用 /refresh-avatar all 可刷新全部群；"
+                "或先 /new-group 创建专属群。"
+            )
+            return
+        session_name = self._chat_bindings.get(chat_id)
+        if not session_name:
+            await card_service.send_text(chat_id, "当前群未绑定会话，无法确定图标类型")
+            return
+        sess = next((s for s in list_active_sessions()
+                     if s["name"] == session_name), None)
+        if sess:
+            cli_type = sess.get('cli_type', 'claude')
+        else:
+            cli_type = await avatar_uploader.infer_cli_type_from_chat(chat_id) or 'claude'
+
+        key = await avatar_uploader.get_avatar_image_key(cli_type, force=True)
+        if not key:
+            await card_service.send_text(
+                chat_id,
+                f"上传 {cli_type} 图标失败，请检查 lark_client/assets/icons/ 下是否有对应 PNG"
+            )
+            return
+        ok, err = await self._update_chat_avatar_via_api(chat_id, key)
+        if ok:
+            await card_service.send_text(chat_id, f"✅ 已更新为 {cli_type} 头像")
+        else:
+            await card_service.send_text(chat_id, f"更新群头像失败：{err}")
 
     async def _disband_group_via_api(self, group_chat_id: str) -> tuple:
         """调用飞书 API 解散群聊，返回 (ok: bool, err_msg: str)"""
@@ -914,7 +1150,14 @@ class LarkHandler:
             ok = await self._attach(chat_id, saved_session, user_id=user_id)
             if ok:
                 return self._bridges.get(chat_id)
-            # 恢复失败：会话已不存在，清除绑定
+            # attach 失败：仅在 session 真的不在时才清绑定 + 解散群；
+            # 否则视作瞬时连接失败（network blip、connect race 等），保留绑定让用户下次重试。
+            # 早期版本无此校验，attach 偶发失败会误把还在跑的会话对应的专属群解散。
+            if is_session_active(saved_session):
+                logger.warning(
+                    f"attach 失败但会话 '{saved_session}' 仍活跃，保留绑定（瞬时连接失败）"
+                )
+                return None
             self._group_chat_ids.discard(chat_id)
             self._save_group_chat_ids()
             self._remove_binding_by_chat(chat_id, force=True)

@@ -36,7 +36,8 @@ from utils.session import (
     is_lark_running, get_lark_pid, get_lark_status, get_lark_pid_file,
     save_lark_status, cleanup_lark,
     USER_DATA_DIR, ensure_user_data_dir, get_lark_log_file,
-    get_env_snapshot_path,
+    get_env_snapshot_path, tildify,
+    write_session_metadata,
 )
 
 
@@ -86,6 +87,30 @@ def cmd_start(args):
     debug_verbose_flag = " --debug-verbose" if getattr(args, "debug_verbose", False) else ""
     cli_type = getattr(args, "cli", "claude")
     cli_type_flag = f" --cli-type {cli_type}" if cli_type != "claude" else ""
+
+    # 解析 --resume 目标（从 claude_args 中提取，兼容 `--resume X` 与 `--resume=X`）
+    resume_target = ""
+    for i, a in enumerate(claude_args):
+        if a == "--resume" and i + 1 < len(claude_args):
+            resume_target = claude_args[i + 1]
+            break
+        if a.startswith("--resume="):
+            resume_target = a.split("=", 1)[1]
+            break
+
+    # 写入会话 metadata（权限 0600）；list_active_sessions 将优先读此文件，
+    # 避免 PTY 首帧写 .mq 之前 cli_type 被默认成 claude 的竞态
+    try:
+        write_session_metadata(
+            session_name=session_name,
+            cli_type=cli_type,
+            resume_target=resume_target,
+            cwd=os.getcwd(),
+            start_time=datetime.now().strftime("%m-%d %H:%M"),
+        )
+    except Exception as _e:
+        # metadata 是优化项，失败不阻止会话启动；后续会通过 .mq 回退
+        print(f"警告：会话 metadata 写入失败，将回退到 .mq ({_e})")
 
     # 捕获用户终端环境变量（tmux 会覆盖这些值，导致 Claude CLI 无法启用 kitty keyboard protocol）
     env_prefix = ""
@@ -141,7 +166,7 @@ def cmd_start(args):
                     if lines:  # 多行日志的续行，附到上一条
                         lines.append(line)
             if lines:
-                print(f"--- Server 日志 ({_log_path}) ---")
+                print(f"--- Server 日志 ({tildify(_log_path)}) ---")
                 print("\n".join(lines))
                 print("-------------------")
         tmux_kill_session(session_name)
@@ -189,6 +214,7 @@ def cmd_list(args):
     # ANSI 颜色码
     YELLOW = "\033[33m"
     GREEN = "\033[32m"
+    MAGENTA = "\033[35m"
     RESET = "\033[0m"
 
     print("活跃会话:")
@@ -200,10 +226,8 @@ def cmd_list(args):
         tmux_status = "是" if s["tmux"] else "否"
         cli_type = s.get('cli_type', 'claude')
         # 根据类型选择颜色
-        if cli_type == 'codex':
-            cli_colored = f"{GREEN}{cli_type}{RESET}"
-        else:
-            cli_colored = f"{YELLOW}{cli_type}{RESET}"
+        _CLI_COLOR_MAP = {'codex': GREEN, 'agent': MAGENTA, 'claude': YELLOW}
+        cli_colored = f"{_CLI_COLOR_MAP.get(cli_type, YELLOW)}{cli_type}{RESET}"
         # 带颜色的字段需要单独计算宽度
         padding = " " * (8 - len(cli_type))
         print(f"{cli_colored}{padding} {s['pid']:<10} {tmux_status:<10} {s['name']}")
@@ -331,14 +355,14 @@ def cmd_lark_start(args):
         if is_lark_running():
             print(f"✓ 飞书客户端已启动")
             print(f"  PID: {pid}")
-            print(f"  日志: {log_file}")
-            print(f"\n使用 'python3 remote_claude.py lark status' 查看状态")
-            print(f"使用 'python3 remote_claude.py lark stop' 停止")
+            print(f"  日志: {tildify(log_file)}")
+            print(f"\n使用 'remote-claude lark status' 查看状态")
+            print(f"使用 'remote-claude lark stop' 停止")
             _start_watchdog()
             return 0
         else:
             print("✗ 启动失败，请查看日志:")
-            print(f"  tail -f {log_file}")
+            print(f"  tail -f {tildify(log_file)}")
             cleanup_lark()
             return 1
 
@@ -415,7 +439,7 @@ def cmd_lark_status(args):
     """显示飞书客户端状态"""
     if not is_lark_running():
         print("飞书客户端未运行")
-        print("\n使用 'python3 remote_claude.py lark start' 启动")
+        print("\n使用 'remote-claude lark start' 启动")
         return 0
 
     status = get_lark_status()
@@ -435,7 +459,7 @@ def cmd_lark_status(args):
     # 检查日志文件
     log_file = get_lark_log_file()
     if log_file.exists():
-        print(f"日志文件: {log_file}")
+        print(f"日志文件: {tildify(log_file)}")
         print(f"日志大小: {log_file.stat().st_size / 1024:.1f} KB")
 
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -488,7 +512,7 @@ def cmd_update(args):
     git_dir = SCRIPT_DIR / ".git"
     if git_dir.exists():
         # 源码安装：git pull 更新
-        print(f"检测到源码安装（{SCRIPT_DIR}）")
+        print(f"检测到源码安装（{tildify(SCRIPT_DIR)}）")
         print("正在更新...")
         result = _sp.run(["git", "pull"], cwd=SCRIPT_DIR)
         if result.returncode != 0:
@@ -503,7 +527,7 @@ def cmd_update(args):
         if "node_modules" in install_dir_str:
             # 本地 npm 安装：找到项目根目录（node_modules 的上两级）
             project_root = SCRIPT_DIR.parent.parent
-            print(f"检测到 npm 本地安装（{project_root}）")
+            print(f"检测到 npm 本地安装（{tildify(project_root)}）")
             print("正在更新...")
             result = _sp.run(["npm", "install", "remote-claude@latest"], cwd=project_root)
         else:
@@ -561,6 +585,13 @@ def cmd_deps(args):
         print_ok("Codex CLI: 已安装")
     else:
         print_warn("Codex CLI: 未安装（可选）")
+
+    # 检查 Cursor Agent CLI（二进制名：agent）
+    agent_path = shutil.which("agent")
+    if agent_path:
+        print_ok(f"Cursor Agent CLI: 已安装 ({tildify(agent_path)})")
+    else:
+        print_warn("Cursor Agent CLI: 未安装（可选）")
 
     # 检查 tmux
     REQUIRED_MAJOR = 3
@@ -678,17 +709,17 @@ def cmd_deps(args):
         if "$HOME/.local/bin" not in rc_content:
             with open(rc_file, "a") as f:
                 f.write(f"\n# remote-claude: tmux 路径\n{path_line}\n")
-            print_ok(f"已将 $HOME/.local/bin 写入 {rc_file}")
+            print_ok(f"已将 $HOME/.local/bin 写入 {tildify(rc_file)}")
     except Exception as e:
-        print_warn(f"无法写入 {rc_file}: {e}")
+        print_warn(f"无法写入 {tildify(rc_file)}: {e}")
 
     # 验证
     tmux_bin = os.path.join(local_bin, "tmux")
     if os.path.exists(tmux_bin):
         r = subprocess.run([tmux_bin, "-V"], capture_output=True, text=True)
         print(f"\n{GREEN}✓ tmux 安装成功: {r.stdout.strip()}{RESET}")
-        print(f"  路径: {tmux_bin}")
-        print(f"  请运行 source {rc_file} 或重新打开终端使 PATH 生效。")
+        print(f"  路径: {tildify(tmux_bin)}")
+        print(f"  请运行 source {tildify(rc_file)} 或重新打开终端使 PATH 生效。")
     else:
         print_err("安装似乎未成功，请检查上方输出。")
         return 1
@@ -710,6 +741,101 @@ def cmd_lark_init(args):
     return rc
 
 
+def cmd_lark_refresh_avatar(args):
+    """重新上传 Claude/Codex/Cursor 品牌图标，并同步到所有已绑定的专属群"""
+    import asyncio
+    import json as _json
+
+    # 加载 ~/.remote-claude/.env
+    env_path = USER_DATA_DIR / ".env"
+    if env_path.exists():
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(env_path)
+        except Exception:
+            pass
+
+    # 必须在 .env 之后导入（config.py 读 env）
+    import sys as _sys
+    _sys.path.insert(0, str(SCRIPT_DIR))
+    from lark_client import avatar_uploader
+    from lark_client import config as _cfg
+    from utils.session import list_active_sessions
+
+    if not (_cfg.FEISHU_APP_ID and _cfg.FEISHU_APP_SECRET):
+        print("❌ 未配置 FEISHU_APP_ID / FEISHU_APP_SECRET（~/.remote-claude/.env）")
+        return 1
+
+    chat_only = getattr(args, "chat_id", None)
+    no_update = getattr(args, "upload_only", False)
+
+    async def _run():
+        # 1. 强制重新上传所有图标（force=True）
+        print("📤 正在上传图标到飞书...")
+        keys = await avatar_uploader.refresh_all()
+        for cli, k in keys.items():
+            status = "✓" if k else "✗"
+            print(f"  {status} {cli}: {k or '上传失败'}")
+        if no_update:
+            return 0
+
+        # 2. 读取 bindings 与 group list
+        bindings_path = USER_DATA_DIR / "lark_chat_bindings.json"
+        group_ids_path = USER_DATA_DIR / "lark_group_ids.json"
+        if not bindings_path.exists() or not group_ids_path.exists():
+            print("⚠️  尚未有任何专属群绑定，跳过群头像更新")
+            return 0
+        try:
+            bindings = _json.loads(bindings_path.read_text(encoding="utf-8"))
+            group_ids = set(_json.loads(group_ids_path.read_text(encoding="utf-8")))
+        except Exception as e:
+            print(f"❌ 读取绑定文件失败: {e}")
+            return 1
+
+        sessions = {s["name"]: s for s in list_active_sessions()}
+        targets = []
+        for cid, sess_name in bindings.items():
+            if cid not in group_ids:
+                continue
+            if chat_only and cid != chat_only:
+                continue
+            sess = sessions.get(sess_name)
+            if sess:
+                cli_type = sess.get("cli_type", "claude")
+            else:
+                # 会话已结束，回退查询群名 `[cli]` 前缀（GET /im/v1/chats/{id}）
+                inferred = await avatar_uploader.infer_cli_type_from_chat(cid)
+                if inferred:
+                    cli_type = inferred
+                    print(f"  (会话已结束，按群名推断 {cid[:12]}… → {cli_type})")
+                else:
+                    cli_type = "claude"
+                    print(f"  ⚠ 无法推断 {cid[:12]}… ({sess_name}) 的 cli_type，默认 claude")
+            targets.append((cid, sess_name, cli_type))
+
+        if not targets:
+            print("⚠️  没有匹配的专属群需要更新")
+            return 0
+
+        print(f"\n🔄 正在更新 {len(targets)} 个群的头像...")
+        ok_count = 0
+        for cid, sess_name, cli_type in targets:
+            key = keys.get(cli_type)
+            if not key:
+                print(f"  ✗ {cid[:12]}… ({sess_name}) — {cli_type} 图标未上传")
+                continue
+            ok, err = await avatar_uploader.update_chat_avatar(cid, key)
+            if ok:
+                ok_count += 1
+                print(f"  ✓ {cid[:12]}… ({sess_name}) → {cli_type}")
+            else:
+                print(f"  ✗ {cid[:12]}… ({sess_name}) — {err}")
+        print(f"\n✅ 完成：{ok_count}/{len(targets)} 个群头像已更新")
+        return 0
+
+    return asyncio.run(_run())
+
+
 def cmd_lark(args):
     """飞书客户端管理（兼容旧命令）"""
     # 如果没有子命令，默认显示状态或启动
@@ -718,22 +844,24 @@ def cmd_lark(args):
     else:
         print("飞书客户端未运行")
         print("\n可用命令:")
-        print("  python3 remote_claude.py lark init     - 配置向导（首次使用）")
-        print("  python3 remote_claude.py lark start    - 启动客户端")
-        print("  python3 remote_claude.py lark stop     - 停止客户端")
-        print("  python3 remote_claude.py lark restart  - 重启客户端")
-        print("  python3 remote_claude.py lark status   - 查看状态")
+        print("  remote-claude lark init     - 配置向导（首次使用）")
+        print("  remote-claude lark start    - 启动客户端")
+        print("  remote-claude lark stop     - 停止客户端")
+        print("  remote-claude lark restart  - 重启客户端")
+        print("  remote-claude lark status   - 查看状态")
         return 0
 
 
 def main():
     parser = argparse.ArgumentParser(
+        prog="remote-claude",
         description="Remote Claude - 双端共享 Claude CLI 工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
   %(prog)s start mywork              启动名为 mywork 的会话
   %(prog)s start mywork --cli codex  启动 codex 会话
+  %(prog)s start mywork --cli agent  启动 Cursor Agent 会话
   %(prog)s attach mywork             连接到 mywork 会话
   %(prog)s list                      列出所有会话
   %(prog)s kill mywork               终止 mywork 会话
@@ -801,8 +929,8 @@ def main():
     start_parser.add_argument(
         "--cli",
         default="claude",
-        choices=["claude", "codex"],
-        help="后端 CLI 类型（默认 claude）"
+        choices=["claude", "codex", "agent"],
+        help="后端 CLI 类型（默认 claude；agent = Cursor Agent CLI）"
     )
     start_parser.set_defaults(func=cmd_start)
 
@@ -851,6 +979,21 @@ def main():
     lark_init_group.add_argument("--check", action="store_true", help="仅检查当前配置状态")
     lark_init_group.add_argument("--new", action="store_true", help="扫码创建新应用（不修改已有配置）")
     lark_init_parser.set_defaults(func=cmd_lark_init)
+
+    # lark refresh-avatar
+    lark_refresh_parser = lark_subparsers.add_parser(
+        "refresh-avatar",
+        help="重新上传 Claude/Codex/Cursor 图标并同步到所有专属群（不需要 lark daemon 运行）"
+    )
+    lark_refresh_parser.add_argument(
+        "--chat-id", dest="chat_id", default=None,
+        help="仅更新指定 chat_id 的群（默认：所有已绑定的群）"
+    )
+    lark_refresh_parser.add_argument(
+        "--upload-only", action="store_true", dest="upload_only",
+        help="仅重新上传图标、不刷任何群"
+    )
+    lark_refresh_parser.set_defaults(func=cmd_lark_refresh_avatar)
 
     # 如果只输入 lark 没有子命令，使用默认处理
     lark_parser.set_defaults(func=cmd_lark)

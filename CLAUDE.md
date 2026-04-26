@@ -7,7 +7,7 @@ This file provides guidance to Claude-Code/Codex when working with code in this 
 
 ## 项目概述
 
-Remote Claude 是一个双端共享 Claude/Codex CLI 工具。通过 PTY + Unix Socket 架构，支持多个终端客户端和飞书客户端并发连接同一个 Claude 或 Codex 会话，实现协作式 AI 对话。
+Remote Claude 是一个双端共享 Claude / Codex / Cursor Agent CLI 工具。通过 PTY + Unix Socket 架构，支持多个终端客户端和飞书客户端并发连接同一个 AI CLI 会话，实现协作式 AI 对话。支持的 `cli_type`：`claude`、`codex`、`agent`（Cursor Agent CLI，二进制名 `agent`）。
 
 ## 架构
 
@@ -29,6 +29,7 @@ client.py  SessionBridge (lark_client/)
 - `server/server.py` — PTY 代理服务器，`pty.fork()` 启动 Claude/Codex，asyncio Unix Socket 广播输出
 - `server/parsers/claude_parser.py` — Claude CLI 终端输出解析（区域切分、Block 分类、执行状态判断）
 - `server/parsers/codex_parser.py` — Codex CLI 终端输出解析（无分割线、`›` 提示符、背景色区域检测）
+- `server/parsers/agent_parser.py` — Cursor Agent CLI 解析器。虽然 Cursor 与 Codex 同属 Ink TUI，但实际 UI 差异很大（所有内容整体右缩进 2 格、输入框用 `▄`/`▀` 半块字符 + fg=#808080 灰色画边而非 pyte bg 属性、输入提示符为 `→` 而非 `›`、输出内容无圆点/星号首列指示字符），因此完全 override `parse()`，用 Cursor 专属路径：▄/▀ 定位输入框 → 剩余区域按欢迎/输出/输入/底部栏切分 → 输出区按空行切成 `OutputBlock` 并剥离 2 空格左缩进。仅复用 CodexParser 的 `__init__` 缓存字段与工具函数。
 - `server/component_parser.py` — 向后兼容 shim（实际实现在 `server/parsers/`）
 - `server/shared_state.py` — 共享内存写入（`.mq` 文件）
 - `client/client.py` — 终端客户端，raw mode 输入转发
@@ -38,10 +39,13 @@ client.py  SessionBridge (lark_client/)
 
 **飞书客户端 (`lark_client/`)：**
 - `main.py` — WebSocket 入口，事件分发
-- `lark_handler.py` — 命令路由，以 `chat_id` 为 key 统一管理群聊/私聊的 bridge 和绑定
+- `lark_handler.py` — 命令路由，以 `chat_id` 为 key 统一管理群聊/私聊的 bridge 和绑定。`_on_disconnect` 断连后调度 `_disband_or_reattach_after_disconnect`（宽限期 3s），通过 `is_session_active` 分流：session 真的结束（`remote-claude kill` / PTY 内 `/exit` 自然退出 / server 崩溃）→ `_disband_groups_for_session` 自动解散绑定的专属群；session 仍活跃（read loop 异常 / socket 瞬时抖动）→ 自动 `_attach` 让卡片继续更新，避免群里永远停在「已断开」。`_ensure_bridge` lazy 重连失败时也用 `is_session_active` 做二次校验，session 仍在则保留绑定不解散群（避免瞬时 connect 失败误杀仍存活会话的专属群）
 - `session_bridge.py` — 连接 Unix Socket，**仅负责输入发送**（send_input/send_key）和连接管理
 - `shared_memory_poller.py` — **流式滚动卡片轮询器**：每秒轮询 `.mq` 共享内存，通过 hash diff 驱动 `CardSlice`/`StreamTracker` 就地更新或冻结+开新卡
 - `card_builder.py` — **`build_stream_card(blocks, status_line, bottom_bar, is_frozen, agent_panel, option_block, session_name, disconnected)`**：四层结构卡片构建（内容区/状态区/交互区/菜单）+ 辅助卡片（session_list/menu/help/dir 等）
+- `avatar_uploader.py` — 群头像管理：按 `cli_type`（claude/codex/agent）上传 `lark_client/assets/icons/*.png` 到飞书 `im/v1/images`（`image_type=avatar`），返回的 `image_key` 缓存到 `~/.remote-claude/lark_avatar_keys.json`；并封装 `update_chat_avatar()` 调 `PUT /im/v1/chats/{id}` 写 `avatar` 字段。入口：
+  - **lark daemon 内**：`_cmd_new_group` 建群时自动带 `avatar=image_key`；`/refresh-avatar` / `/refresh-avatar all` 命令运行时刷新
+  - **CLI**：`remote-claude lark refresh-avatar` 不依赖 daemon 运行，直接读 `~/.remote-claude/lark_chat_bindings.json` + `lark_group_ids.json` 批量更新；`--chat-id <id>` 仅更新单个群；`--upload-only` 只重传图标不刷群
 - `card_service.py` — 飞书卡片 API 服务（create/update/send）
 - `rich_text_renderer.py` — 持久化 pyte Screen 封装（server 端实时喂入）
 
@@ -67,7 +71,12 @@ PTY data → self._renderer.feed(data) → HistoryScreen(220×100, history=5000)
                                  │ 平滑 block blink     │
                                  └────────┬──────────┘
                                           ↓
-                                    all_blocks = visible_blocks
+                                 ┌── Ink 重绘副本去重 ──┐
+                                 │ pass 1 按 block_id     │
+                                 │ pass 2 按正文 hash     │
+                                 └────────┬─────────────┘
+                                          ↓
+                                    all_blocks = 去重后的 visible_blocks
                                           ↓
                                     ClaudeWindow 快照
                                           ↓
@@ -102,8 +111,8 @@ CardService                 → 同一张卡片就地更新 / 超限时冻结+�
 - **输入端**（`_forward_to_claude` / `handle_option_select`）只调用 `bridge.send_input/send_key`，不创建卡片
 - **输出端**完全由 `SharedMemoryPoller` 驱动：attach 时启动轮询，detach/断线时停止
 - **流式滚动窗口**：`StreamTracker` 跟踪 blocks 流，`CardSlice` 记录每张卡片的窗口位置（`start_idx`）
-- **首次 attach**：取最近 `INITIAL_WINDOW=30` 个 blocks 渲染到一张卡片，更早内容通过 `/history` 查看
-- **卡片超限**：`len(blocks) - start_idx > MAX_CARD_BLOCKS=50` 时冻结当前卡（灰色 header、移除状态区和按钮区），从冻结位置之后开新卡
+- **首次 attach**：取最近 `INITIAL_WINDOW`（=`MAX_CARD_BLOCKS`）个 blocks 渲染到一张卡片，更早内容通过 `/history` 查看
+- **卡片超限**：`len(blocks) - start_idx > MAX_CARD_BLOCKS`（默认 15，可通过 `MAX_CARD_BLOCKS` env 覆盖）时冻结当前卡（灰色 header、移除状态区和按钮区），从冻结位置之后开新卡。活跃卡片长度始终 ≤ `MAX_CARD_BLOCKS`，保证长对话时卡片不会越堆越高
 - **群聊/私聊统一**：`_bridges[chat_id]` 和 `_chat_sessions[chat_id]` 统一管理，无需分组
 - **降级机制**：update_card 失败时创建新卡片，更新 CardSlice 中的 card_id，sequence 归零
 - **持久化绑定**：`~/.remote-claude/lark_chat_bindings.json`（chat_id → session_name）
@@ -220,7 +229,16 @@ ClaudeWindow {
 - `Q:{question[:80]}` — OptionBlock(sub_type="option")
 - `P:{question[:80]}` — OptionBlock(sub_type="permission")
 
-**累积列表（VirtualScreen 模式）**：`visible_blocks` 直接来自 VirtualScreen 解析（含 history.top 中已滚出的历史行），`all_blocks = visible_blocks`，不再需要 `_accumulated_blocks` 和 `_merge_blocks`。历史由 `HistoryScreen.history.top`（5000 行容量）保存，parser 通过 VirtualBuffer 透明访问。
+**累积列表（VirtualScreen 模式）**：`visible_blocks` 直接来自 VirtualScreen 解析（含 history.top 中已滚出的历史行），随后交给 `_dedup_blocks()` 合并相邻副本得到 `all_blocks`。历史由 `HistoryScreen.history.top`（5000 行容量）保存，parser 通过 VirtualBuffer 透明访问。
+
+**Ink 重绘副本合并**（`server/server.py` `_dedup_blocks`）：Claude/Codex/Cursor Agent 均基于 Ink 框架，输出超过 `PTY_ROWS` 时会整屏重绘，旧渲染被挤进 `history.top`、新渲染落回 `buffer`。如果 Ink 重写同一整屏，VirtualScreen 里会出现紧邻的多份相同 block（典型症状：最终总结被重复 N 遍）。
+
+策略（保守，只合并明确的副本）：
+- **合并条件三合一**：类型相同 + 整块内容字节一致 + 在列表中紧邻
+- **跨越其它 block 的重复一律保留**：例如用户两次请求得到首行相同的回复、两次计划叫同一个标题、两次系统提示 `✻ Using memory...` 分别出现，都属于合法历史，不合并
+- **合并时用后者覆盖**：保留最新渲染位置（`start_row` 反映最近一次）
+
+**不做的事**（避免误杀历史）：不按首行做全局去重、不按内容 hash 跨块去重 —— 两者都会静默删掉合法重复内容。相关回归测试见 `tests/test_dedup_blocks.py` 的 `TestNoFalsePositives` 组。
 
 **时序窗口平滑**（WINDOW_SECONDS=1.0）：
 - 每帧记录 `_FrameObs(ts, status_line, block_blink)` 到 deque，清理过期帧
@@ -580,6 +598,93 @@ Pass 1 算法（`_find_bg_region`）：从下往上找连续 bg zone → zone �
 
 > Codex 与 Claude Code 的核心区别：Claude Code 用**不同字符**区分（星星=StatusLine，圆点=OutputBlock），Codex 用**同一圆点字符 + blink 属性**区分。
 
+---
+
+**Cursor Agent CLI 终端输出解析规则（`server/parsers/agent_parser.py`）：**
+
+Cursor Agent 虽然和 Codex 同为 Ink 框架，但 UI 设计差异很大，必须由 `AgentParser` 独立处理，不能复用 `CodexParser._split_regions`。
+
+### Cursor Agent 终端布局（实测）
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                                                         │  ← 上方留空
+│   Cursor Agent                                          │  ← 标题（col=2）
+│   v2026.04.17-787b533                                   │  ← 版本号（紧跟标题，会被 trim）
+│                                                         │
+│   say hi in one short sentence                          │  ← 用户输入回显（col=2，fg=#808080）
+│                                                         │
+│                                                         │
+│   Hi there — I'm here and ready to help.                │  ← agent 回复（col=2，fg=#808080）
+│                                                         │
+│   ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄...▄▄▄▄  │  ← 输入框上边框（半块字符 fg=#808080）
+│   → Add a follow-up                                     │  ← 输入行（→ U+2192，col=2）
+│   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀...▀▀▀▀  │  ← 输入框下边框（半块字符 fg=#808080）
+│   Composer 2 Fast · 5.2%                                │  ← 底部栏：模型 + 使用率
+│   /private/tmp                                          │  ← 底部栏：cwd
+└─────────────────────────────────────────────────────────┘
+```
+
+**首启动还会出现 `╭───╮` Workspace Trust Required 对话框**（col=2 起的 box-drawing 框），在信任之前没有输入框。
+
+### 与 Claude / Codex 的关键差异
+
+| 特性 | Claude Code | Codex | Cursor Agent |
+|------|-------------|-------|--------------|
+| 内容缩进 | col=0 起 | col=0 起 | **所有内容整体右缩进 2 列**，col=0/1 恒为空格 |
+| 区域分割 | `─━═` 分割线 | 连续背景色 zone + 纯背景色首尾边界 | **▄/▀ 半块字符 + fg=#808080 画出的输入框**（非 pyte bg 属性） |
+| 输入提示符 | `❯` (U+276F) | `›` (U+203A) | **`→` (U+2192)** |
+| 输出指示字符 | `●` / `⏺` | `•` | **无**，纯文本渲染（fg=#808080 灰色） |
+| StatusLine | 星星字符 blink | 圆点字符 blink | 暂未识别（本版本不处理） |
+
+### Cursor Agent 区域切分策略（以 `→` 行为锚）
+
+从 `cursor.y+5` 向上扫描，找到首个 strip 后行首为 `→` 的行作为 **input_row**（锚点）。以 input_row 为基准：
+1. 上邻行若为 ≥10 连续 `▄` 行 → top_border（可选）
+2. 下邻行若为 ≥10 连续 `▀` 行 → bot_border（可选）
+3. `box_start` = top_border or input_row；`box_end` = bot_border or input_row
+4. 输出区 = `rows[0:box_start]`；input_rows = `[input_row]`；bottom_rows = `rows[box_end+1 : box_end+1+4]`
+
+**为什么以 → 行为锚而非 ▄/▀**：Cursor Agent 在思考早期阶段常常只渲染上半边框（`▄`）而缺下边框（`▀`），此时若要求 ▄/▀ 配对会丢失整个输入区，进而把 spinner 行和底部栏都错划到 output_rows 里去。→ 提示符字符独特且总是出现，是最稳定的锚点。
+
+若未找到 `→`（如首启动 Trust 对话框尚未关闭），则整个可见范围全部作为 output_rows 走 `_trim_cursor_welcome` 路径，最终产出 0 block（欢迎框被整块丢弃）。
+
+### Cursor Agent 欢迎区识别（`_trim_cursor_welcome`）
+
+遍历 output_rows，丢弃以下内容：
+- 整行文本 `== "Cursor Agent"`：标题行
+- 紧随其后的 `v20...` 版本号行
+- 任意行首非空字符 ∈ `BOX_CORNER_TOP`（`╭` / `┌`）：整个 box 丢弃（含中间所有 `│` 行，直到匹配到 `BOX_CORNER_BOTTOM`）
+
+**注意：** 因为所有内容向右 indent 2 列，不能用 `_get_col0`（col=0 恒为空格），需要对 row 文本 `.strip()` 后再看首字符。
+
+### Cursor Agent 输出区分块（`_parse_output_indented`）
+
+Cursor Agent 的输出无圆点/星号等首列指示字符，每条消息是纯文本块，块之间用**空行分隔**（可能 1 行或多行空行）：
+- 遍历 output_rows，连续非空行归为一个 group，遇到空行则 flush 为一个 `OutputBlock`
+- 每行文本剥离最左 2 空格缩进（`if raw.startswith('  '): raw = raw[2:]`）
+- `block_id` 走 `OutputBlock` 默认前缀 `O:{首行}`
+
+本版本不区分"用户输入回显"和"agent 回复"，两者都产出 `OutputBlock`（后续如需精细区分，可按 bg 属性或位置推断）。本版本也不解析 OptionBlock、AgentPanelBlock（Cursor Agent 暂未观察到这些场景的稳定样本）。
+
+### Cursor Agent 思考/执行中 StatusLine 识别（`_extract_status_line`）
+
+Cursor Agent 在思考/工具调用/读取文件时，会在输出区尾部（紧挨 `▄` 上边框前）渲染一行形如：
+
+```
+  ⠳⠀ Working
+  ⠰⠃ Running  53 tokens
+  ⠛⠄ Reading  24.16k tokens
+```
+
+**识别特征**：
+- 行首若干列（col=1~5）含至少一个 **braille 点阵字符**（U+2800–U+28FF），并且**至少一个 braille 字符 fg 为绿色系**（green / brightgreen / hex 颜色中 G 显著 > R、B）。
+- 剥离行首 braille 帧字符与空白后，第一个单词是 action（`Working`、`Running`、`Reading` 等），后续文字作为 `tokens`（如 `53 tokens`）。
+
+**处理**：匹配到的行从 output_rows 中剔除，升级为 `StatusLine(action, tokens, raw, indicator, ...)`。这样 lark 卡片 header 才会按 CLAUDE 规则显示 `⏳ {action}` 橙色，而不是退化到 `✅ Cursor 就绪`。
+
+注意不能只靠 "content 含 Working/Running" 等关键词（Cursor 输出里 shell 命令、模型名里可能出现），必须要有 braille + green 双重特征。
+
 ## 文件结构
 
 ```
@@ -592,7 +697,8 @@ remote_claude/
 │   ├── parsers/
 │   │   ├── base_parser.py      # 解析器基类
 │   │   ├── claude_parser.py    # Claude CLI 解析器
-│   │   └── codex_parser.py     # Codex CLI 解析器（背景色区域检测/›提示符/颜色模式区分）
+│   │   ├── codex_parser.py     # Codex CLI 解析器（背景色区域检测/›提示符/颜色模式区分）
+│   │   └── agent_parser.py     # Cursor Agent CLI 解析器（▄/▀ 输入框定位、2 空格 indent 剥离、→ 提示符）
 │   ├── shared_state.py         # 共享内存写入（.mq 文件）
 │   └── rich_text_renderer.py   # 历史文件（暂保留）
 │
@@ -608,6 +714,8 @@ remote_claude/
 │   ├── main.py                 # WebSocket 入口
 │   ├── lark_handler.py         # 命令路由（群聊/私聊统一逻辑）
 │   ├── session_bridge.py       # Unix Socket 桥接（仅输入发送）
+│   ├── avatar_uploader.py      # 群头像上传（cli_type → image_key，本地缓存）
+│   ├── assets/icons/           # 品牌图标：claude.png / codex.png / cursor.png
 │   ├── shared_memory_poller.py # 流式滚动卡片轮询器（CardSlice/StreamTracker）
 │   ├── card_builder.py         # 卡片构建（build_stream_card + 辅助卡片）
 │   ├── card_service.py         # 卡片更新服务
@@ -621,6 +729,11 @@ remote_claude/
 │   ├── test_format_unit.py     # 格式化单元测试
 │   ├── test_component_parser.py
 │   ├── test_stream_poller.py   # 流式卡片模型单元测试（card_builder + poller）
+│   ├── test_dedup_blocks.py    # Ink 重绘副本合并单元测试（相邻 + 全内容一致）
+│   ├── test_agent_parser.py    # Cursor Agent 解析器单元测试（▄/▀ 边框、2 空格 indent、→ prompt）
+│   ├── test_avatar_uploader.py # 群头像上传器单元测试（图标映射、缓存命中、force 刷新）
+│   ├── test_notify_mode.py     # 完成通知模式与冷却回归测试
+│   ├── test_session_end_disband.py # 会话结束自动解散专属群回归测试
 │   ├── test_integration.py     # 集成测试
 │   ├── test_attach_dedup.py
 │   ├── test_message_queue.py
@@ -665,6 +778,8 @@ cla                    # 启动飞书客户端 + 以当前目录路径为会话�
 cl                     # 同 cla，但跳过权限确认
 cx                     # 启动飞书客户端 + 以当前目录路径为会话名启动 Codex（跳过权限确认）
 cdx                    # 同 cx，但需要确认权限
+cag                    # 启动飞书客户端 + 以当前目录路径为会话名启动 Cursor Agent（--yolo 免确认）
+cagn                   # 同 cag，但不传 --yolo，保留权限确认
 
 # 启动会话
 uv run python3 remote_claude.py start <会话名> [-- claude 参数]
@@ -695,6 +810,11 @@ uv run python3 remote_claude.py lark status    # 查看状态和日志
 ```bash
 uv run python3 tests/test_format_unit.py                  # 格式化逻辑单元测试（见 TEST_PLAN.md 层1）
 uv run python3 tests/test_stream_poller.py                # 流式卡片模型测试（card_builder + poller）
+uv run python3 tests/test_dedup_blocks.py                 # Ink 重绘副本合并测试（server._dedup_blocks）
+uv run python3 tests/test_agent_parser.py                 # Cursor Agent 解析器测试（▄/▀ 边框、indent、→ prompt）
+uv run python3 tests/test_avatar_uploader.py              # 群头像上传器测试（图标映射、缓存命中、force 刷新）
+uv run python3 tests/test_notify_mode.py                  # 通知模式与跨任务冷却测试
+uv run python3 tests/test_session_end_disband.py          # 会话结束自动解散专属群测试
 uv run python3 tests/test_renderer.py                     # 终端渲染器测试
 uv run python3 tests/test_output_clean.py                 # 输出清理器测试
 uv run python3 lark_client/output_cleaner.py              # output_cleaner 自带测试
@@ -738,6 +858,7 @@ uv run python3 lark_client/capture_output.py <会话名> [秒数]  # 捕获原�
 - **历史缓冲区：** 100KB 循环缓冲，重连时自动发送
 - **输出延迟：** 飞书侧 2-3 秒等待动画稳定后再发送；完成检测基于状态行（~2s），非超时
 - **语言：** 代码注释和用户交互均使用中文
+- **进程标题：** server 和 lark daemon 均通过 `setproctitle` 设置易读的进程名，在活动监视器 / `ps`（COMM 列）中显示为 `remote-claude server [session=<name>] [cli=<type>]` 和 `remote-claude lark`；按 `remote-claude` 关键词即可过滤本工具的全部进程
 
 ### 飞书客户端管理
 

@@ -8,6 +8,7 @@
 
 import hashlib
 import os
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -34,6 +35,11 @@ def get_chat_bindings_file() -> Path:
 def get_lark_log_file() -> Path:
     """获取飞书客户端日志文件路径"""
     return USER_DATA_DIR / "lark_client.log"
+
+
+def get_startup_log_file() -> Path:
+    """获取启动日志文件路径"""
+    return USER_DATA_DIR / "startup.log"
 
 
 def ensure_user_data_dir():
@@ -76,6 +82,47 @@ def get_name_file(session_name: str) -> Path:
     return SOCKET_DIR / f"{_safe_filename(session_name)}.name"
 
 
+def get_meta_path(session_name: str) -> Path:
+    """获取会话元数据文件路径（在 cmd_start 阶段写入，固定不变）。
+
+    内容：{session_name, cli_type, resume_target, cwd, start_time}
+    list_active_sessions 优先读此文件，避免 PTY 首帧前 .mq 为空时 cli_type 默认成 claude 的竞态。
+    """
+    return SOCKET_DIR / f"{_safe_filename(session_name)}.meta.json"
+
+
+def write_session_metadata(session_name: str, cli_type: str, resume_target: str,
+                            cwd: str, start_time: str) -> None:
+    """cmd_start 阶段写入会话元数据（权限 0600）。"""
+    import json as _json
+    path = get_meta_path(session_name)
+    data = {
+        "session_name": session_name,
+        "cli_type": cli_type or "claude",
+        "resume_target": resume_target or "",
+        "cwd": cwd or "",
+        "start_time": start_time or "",
+    }
+    # 先写 tmp 再 rename，避免半写状态被 reader 看到
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        _json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
+
+def _read_session_metadata_by_safe_name(safe_name: str) -> Optional[dict]:
+    """以 safe_name（已哈希）读取 .meta.json。读不到或文件损坏返回 None。"""
+    import json as _json
+    path = SOCKET_DIR / f"{safe_name}.meta.json"
+    if not path.exists():
+        return None
+    try:
+        return _json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def ensure_socket_dir():
     """确保 socket 目录存在"""
     SOCKET_DIR.mkdir(parents=True, exist_ok=True)
@@ -89,6 +136,33 @@ def generate_client_id() -> str:
 def get_tmux_session_name(session_name: str) -> str:
     """获取 tmux 会话名称"""
     return f"{TMUX_SESSION_PREFIX}{_safe_filename(session_name)}"
+
+
+def _read_resume_target_from_startup_log(session_name: str) -> str:
+    """从 startup.log 回溯提取某个会话的 `--resume` 目标。"""
+    log_path = get_startup_log_file()
+    if not log_path.exists():
+        return ""
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+
+    for line in reversed(lines):
+        if "server_cmd:" not in line or session_name not in line or "--resume" not in line:
+            continue
+        try:
+            argv = shlex.split(line.split("server_cmd:", 1)[1].strip())
+        except ValueError:
+            continue
+        if session_name not in argv:
+            continue
+        for i, arg in enumerate(argv):
+            if arg == "--resume" and i + 1 < len(argv):
+                return argv[i + 1].strip()
+            if arg.startswith("--resume="):
+                return arg.split("=", 1)[1].strip()
+    return ""
 
 
 # ============== tmux 操作 ==============
@@ -264,26 +338,41 @@ def list_active_sessions() -> List[dict]:
                     mtime = 0
                     start_time = "?"
 
-                # 读取 .mq 文件获取 cli_type
-                try:
-                    import sys
-                    from pathlib import Path
-                    import logging
-                    project_root = str(Path(__file__).parent.parent)
-                    if project_root not in sys.path:
-                        sys.path.insert(0, project_root)
-                    from server.shared_state import SharedStateReader
-                    # 用 _BypassHashReader 直接传入 safe_name 避免二次哈希
-                    mq_path = SOCKET_DIR / f"{safe_name}.mq"
-                    reader = SharedStateReader.__new__(SharedStateReader)
-                    reader._path = mq_path
-                    snapshot = reader.read()
-                    cli_type = snapshot.get("cli_type", "claude")
-                except Exception as e:
-                    import logging
-                    logger = logging.getLogger('Session')
-                    logger.warning(f"读取共享内存 cli_type 失败: session={display_name}, error={e}")
-                    cli_type = "claude"
+                # 优先读 .meta.json（cmd_start 阶段写入，固定不变，不受 PTY 首帧竞态影响）
+                meta = _read_session_metadata_by_safe_name(safe_name)
+                if meta:
+                    cli_type = meta.get("cli_type") or "claude"
+                    resume_target = meta.get("resume_target") or ""
+                    meta_start_time = meta.get("start_time") or ""
+                    if meta_start_time:
+                        start_time = meta_start_time
+                    meta_cwd = meta.get("cwd") or ""
+                    if meta_cwd and not cwd:
+                        cwd = meta_cwd
+                else:
+                    # 老会话无 meta；回退读 .mq 快照 + startup.log
+                    try:
+                        import sys
+                        from pathlib import Path
+                        import logging
+                        project_root = str(Path(__file__).parent.parent)
+                        if project_root not in sys.path:
+                            sys.path.insert(0, project_root)
+                        from server.shared_state import SharedStateReader
+                        mq_path = SOCKET_DIR / f"{safe_name}.mq"
+                        reader = SharedStateReader.__new__(SharedStateReader)
+                        reader._path = mq_path
+                        snapshot = reader.read()
+                        cli_type = snapshot.get("cli_type", "claude")
+                        resume_target = snapshot.get("resume_target", "")
+                        if not resume_target:
+                            resume_target = _read_resume_target_from_startup_log(display_name)
+                    except Exception as e:
+                        import logging
+                        logger = logging.getLogger('Session')
+                        logger.warning(f"读取共享内存 cli_type 失败: session={display_name}, error={e}")
+                        cli_type = "claude"
+                        resume_target = _read_resume_target_from_startup_log(display_name)
 
                 # tmux 会话名也用 safe_name 直接构造
                 tmux_name = f"{TMUX_SESSION_PREFIX}{safe_name}"
@@ -300,7 +389,8 @@ def list_active_sessions() -> List[dict]:
                     "start_time": start_time,
                     "mtime": mtime,
                     "tmux": tmux_exists,
-                    "cli_type": cli_type
+                    "cli_type": cli_type,
+                    "resume_target": resume_target,
                 })
             except (ProcessLookupError, ValueError, OSError):
                 # 进程不存在或文件被并发清理，清理残留文件
@@ -329,7 +419,8 @@ def _cleanup_by_safe_name(safe_name: str, session_name: Optional[str] = None):
                 session_name = name_file.read_text().strip()
             except OSError:
                 pass
-    for suffix in [".sock", ".pid", ".mq", ".name", "_env.json"]:
+    for suffix in [".sock", ".pid", ".mq", ".name", ".meta.json",
+                   ".meta.json.tmp", "_env.json"]:
         (SOCKET_DIR / f"{safe_name}{suffix}").unlink(missing_ok=True)
     # 清理带后缀的日志文件（使用可读文件名）
     log_suffixes = ["_messages.log", "_screen.log", "_server.log", "_debug.log", "_pty_raw.log"]
@@ -359,6 +450,21 @@ def is_session_active(session_name: str) -> bool:
 
 
 # ============== 终端工具 ==============
+
+def tildify(path) -> str:
+    """把绝对路径中的家目录前缀替换为 `~`，仅用于用户可见的展示文本。"""
+    if path is None:
+        return ""
+    s = str(path)
+    if not s:
+        return s
+    home = str(Path.home())
+    if s == home:
+        return "~"
+    if s.startswith(home + os.sep):
+        return "~" + s[len(home):]
+    return s
+
 
 def get_terminal_size() -> tuple:
     """获取终端大小"""
