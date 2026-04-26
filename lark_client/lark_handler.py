@@ -212,32 +212,50 @@ class LarkHandler:
         if active_slice:
             await self._update_card_disconnected(chat_id, session_name, active_slice)
 
-        # session 若已彻底结束（kill / PTY 自然退出 / server 崩溃），解散绑定的专属群。
-        # 延迟一点再判断，避免与 server._shutdown() 里 cleanup_session 的竞态：
-        # clients 先被 close，cleanup_session 在后面才执行，存在短暂 pid/sock 仍存在的窗口。
-        asyncio.create_task(self._disband_if_session_gone(session_name))
+        # 等一段宽限期再判定：
+        # - session 已彻底结束（kill / PTY 自然退出 / server 崩溃）→ 解散绑定的专属群
+        # - session 仍活跃（read loop 异常 / socket 瞬时抖动）→ 自动 re-attach，
+        #   避免群里卡片永远停在"已断开"，必须用户操作才能恢复
+        asyncio.create_task(
+            self._disband_or_reattach_after_disconnect(chat_id, session_name)
+        )
 
-    async def _disband_if_session_gone(self, session_name: str,
-                                        grace_seconds: float = 3.0) -> None:
-        """断线后等待 grace_seconds，确认 session 已彻底结束才解散绑定的专属群。
+    async def _disband_or_reattach_after_disconnect(
+        self, chat_id: str, session_name: str, grace_seconds: float = 3.0
+    ) -> None:
+        """断线宽限期后分流：
 
-        判定依据：`is_session_active` 综合检查 socket、pid 文件及进程存活。
-        server._shutdown 最后才 `cleanup_session`，因此一段宽限期后仍未活跃即判定为
-        session 真的结束（而非网络抖动或 lark daemon 重启）。
+        - session 真的结束 → 解散绑定到该 session 的所有专属群（含本 chat_id）
+        - session 仍活跃 → 视作瞬时抖动，自动 re-attach 让卡片继续更新
+
+        宽限期用于：
+        1. 避开 `server._shutdown()` 的清理顺序（先 close client、最后才 cleanup_session）
+        2. 让用户后续 `/attach` 等显式操作覆盖本协程的自动决策
         """
         await asyncio.sleep(grace_seconds)
-        if is_session_active(session_name):
-            logger.debug(f"会话 '{session_name}' 仍活跃，跳过自动解散群")
+
+        if not is_session_active(session_name):
+            bound_groups = [cid for cid in self._group_chat_ids
+                            if self._chat_bindings.get(cid) == session_name]
+            if not bound_groups:
+                return
+            logger.info(f"会话 '{session_name}' 已结束，自动解散 {len(bound_groups)} 个专属群")
+            await self._disband_groups_for_session(session_name, source="session-end")
             return
 
-        # 仅当确实有绑定群时才走解散路径，避免无意义的日志
-        bound_groups = [cid for cid in self._group_chat_ids
-                        if self._chat_bindings.get(cid) == session_name]
-        if not bound_groups:
+        # session 仍活跃：仅当 chat_id 仍绑定到同一 session 且无新 bridge 时才 re-attach，
+        # 避免覆盖用户期间手动 /attach 切到别的 session 的状态。
+        if self._chat_bindings.get(chat_id) != session_name:
             return
-
-        logger.info(f"会话 '{session_name}' 已结束，自动解散 {len(bound_groups)} 个专属群")
-        await self._disband_groups_for_session(session_name, source="session-end")
+        if self._bridges.get(chat_id) is not None:
+            return
+        logger.info(f"会话 '{session_name}' 仍活跃但连接断开，自动 re-attach: chat_id={chat_id[:8]}...")
+        try:
+            ok = await self._attach(chat_id, session_name)
+            if not ok:
+                logger.warning(f"自动 re-attach 失败: chat_id={chat_id[:8]}..., session={session_name}")
+        except Exception as e:
+            logger.error(f"自动 re-attach 异常: {e}")
 
     # ── 消息入口 ────────────────────────────────────────────────────────────
 
@@ -1132,7 +1150,14 @@ class LarkHandler:
             ok = await self._attach(chat_id, saved_session, user_id=user_id)
             if ok:
                 return self._bridges.get(chat_id)
-            # 恢复失败：会话已不存在，清除绑定
+            # attach 失败：仅在 session 真的不在时才清绑定 + 解散群；
+            # 否则视作瞬时连接失败（network blip、connect race 等），保留绑定让用户下次重试。
+            # 早期版本无此校验，attach 偶发失败会误把还在跑的会话对应的专属群解散。
+            if is_session_active(saved_session):
+                logger.warning(
+                    f"attach 失败但会话 '{saved_session}' 仍活跃，保留绑定（瞬时连接失败）"
+                )
+                return None
             self._group_chat_ids.discard(chat_id)
             self._save_group_chat_ids()
             self._remove_binding_by_chat(chat_id, force=True)

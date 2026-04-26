@@ -39,7 +39,7 @@ client.py  SessionBridge (lark_client/)
 
 **飞书客户端 (`lark_client/`)：**
 - `main.py` — WebSocket 入口，事件分发
-- `lark_handler.py` — 命令路由，以 `chat_id` 为 key 统一管理群聊/私聊的 bridge 和绑定。`_on_disconnect` 断连后会调度 `_disband_if_session_gone`（宽限期 3s），通过 `is_session_active` 二次确认；只有在 session 真的结束（`remote-claude kill` / PTY 内 `/exit` 自然退出 / server 崩溃）时才走 `_disband_groups_for_session` 自动解散绑定的专属群
+- `lark_handler.py` — 命令路由，以 `chat_id` 为 key 统一管理群聊/私聊的 bridge 和绑定。`_on_disconnect` 断连后调度 `_disband_or_reattach_after_disconnect`（宽限期 3s），通过 `is_session_active` 分流：session 真的结束（`remote-claude kill` / PTY 内 `/exit` 自然退出 / server 崩溃）→ `_disband_groups_for_session` 自动解散绑定的专属群；session 仍活跃（read loop 异常 / socket 瞬时抖动）→ 自动 `_attach` 让卡片继续更新，避免群里永远停在「已断开」。`_ensure_bridge` lazy 重连失败时也用 `is_session_active` 做二次校验，session 仍在则保留绑定不解散群（避免瞬时 connect 失败误杀仍存活会话的专属群）
 - `session_bridge.py` — 连接 Unix Socket，**仅负责输入发送**（send_input/send_key）和连接管理
 - `shared_memory_poller.py` — **流式滚动卡片轮询器**：每秒轮询 `.mq` 共享内存，通过 hash diff 驱动 `CardSlice`/`StreamTracker` 就地更新或冻结+开新卡
 - `card_builder.py` — **`build_stream_card(blocks, status_line, bottom_bar, is_frozen, agent_panel, option_block, session_name, disconnected)`**：四层结构卡片构建（内容区/状态区/交互区/菜单）+ 辅助卡片（session_list/menu/help/dir 等）

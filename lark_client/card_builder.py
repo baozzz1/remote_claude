@@ -13,6 +13,7 @@ import logging
 import re as _re
 import pathlib as _pl
 import json as _json
+from datetime import datetime as _datetime
 from typing import Dict, Any, List, Optional
 
 _cb_logger = logging.getLogger('CardBuilder')
@@ -1369,14 +1370,19 @@ def _toggle_row(label: str, value_text: str, value_color: str, action: str,
 def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None,
                     session_groups: Optional[Dict[str, str]] = None, page: int = 0,
                     notify_mode: str = "once", urgent_enabled: bool = False,
-                    bypass_enabled: bool = False) -> Dict[str, Any]:
+                    bypass_enabled: bool = False,
+                    refreshed_at: Optional[_datetime] = None) -> Dict[str, Any]:
     """快捷操作菜单卡片（/menu 和 /list 共用）。
 
     卡片结构（自上而下）：
-      - header：仅标题，不追加版本号副标题，保持视觉干净
+      - header：仅标题，不追加版本号副标题,保持视觉干净
       - 会话列表：标题「会话 · N」，每个会话 2 行信息 + 1 行按钮
       - 工作区：3 个等宽按钮（文件列表 / 目录树 / 刷新）
       - 偏好设置：3 行同构 toggle（完成通知 / 加急通知 / 新会话 bypass）
+      - 末尾灰色 footer：「刷新于 HH:MM:SS」，让用户判断卡片是否过期、是否需要再点一次「🔄 刷新」
+
+    `refreshed_at`：默认 None 时由 builder 取当前时间（即卡片构建时刻），
+    跨进程显式传值仅用于测试或回放场景。
     """
     from .shared_memory_poller import notify_mode_label
 
@@ -1451,6 +1457,15 @@ def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None,
         value_color="orange" if bypass_enabled else "grey",
         action="menu_toggle_bypass",
     ))
+
+    # ── Footer：刷新时间戳 ──
+    ts = (refreshed_at or _datetime.now()).strftime("%H:%M:%S")
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "markdown",
+        "content": f"<font color='grey'>🕒 刷新于 {ts}</font>",
+        "text_align": "right",
+    })
 
     return {
         "schema": "2.0",
